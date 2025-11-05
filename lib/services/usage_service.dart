@@ -1,6 +1,7 @@
 import 'package:usage_stats/usage_stats.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:refocus_app/database_helper.dart';
+import 'package:refocus_app/services/lock_state_manager.dart';
 import 'dart:convert';
 
 class UsageService {
@@ -14,17 +15,74 @@ class UsageService {
     return granted;
   }
 
-  /// ✅ ONE DATABASE FOR ALL APPS - Only selected apps show in totals
+  /// Reset today's in-memory aggregates for testing: clears per-app usage,
+  /// unlocks, longest session, processed events, and active session markers.
+  static Future<void> resetTodayAggregates() async {
+    final prefs = await SharedPreferences.getInstance();
+    final today = DateTime.now().toIso8601String().substring(0, 10);
+
+    await prefs.setString('per_app_usage_$today', '{}');
+    await prefs.setString('per_app_unlocks_$today', '{}');
+    await prefs.setString('per_app_longest_$today', '{}');
+    await prefs.setString('processed_$today', '[]');
+    await prefs.remove('active_app_$today');
+    await prefs.remove('active_start_$today');
+    await prefs.remove('active_recorded_$today');
+
+    // Anchor last_check to NOW so past events are not reprocessed
+    await prefs.setInt('last_check_$today', DateTime.now().millisecondsSinceEpoch);
+    print('🧪 UsageService: Today\'s aggregates reset for testing');
+  }
+
+  /// ✅ TRACKS ONLY SELECTED APPS
+  /// 
+  /// IMPORTANT: Stats tracking behavior:
+  /// - ONLY selected apps are tracked and saved to database
+  /// - Selected apps count toward usage limits (Daily Usage, Max Session, Most Unlock)
+  /// - Stats persist throughout the day and accumulate (DO NOT reset during cooldowns or app switches)
+  /// - Stats only reset at midnight when new day is detected
+  /// - App switching does NOT reset or affect usage counters - tracking continues seamlessly
+  /// - Session tracking continues across app switches (switching between selected apps doesn't reset session)
+  /// - Daily limit violation does NOT reset stats - only midnight reset does
+  /// - Session/unlock violations reset their respective counters but NOT overall stats
+  /// 
+  /// @param currentForegroundApp - The package name of the currently foreground app (for real-time tracking)
+  /// @param updateSessionTracking - Set to false during cooldowns to prevent session restart
   static Future<Map<String, dynamic>> getUsageStatsWithEvents(
-    List<Map<String, String>> selectedApps,
-  ) async {
+    List<Map<String, String>> selectedApps, {
+    String? currentForegroundApp,
+    bool updateSessionTracking = true,
+  }) async {
     try {
       final prefs = await SharedPreferences.getInstance();
       final today = DateTime.now().toIso8601String().substring(0, 10);
+      
+      // ✅ CRITICAL: If Emergency Override is enabled, return cached stats without updating
+      // This prevents usage from accumulating when the user has emergency override ON
+      final isOverrideEnabled = prefs.getBool('emergency_override_enabled') ?? false;
+      if (isOverrideEnabled) {
+        print("🚨 Emergency Override: ON - Returning cached stats, no new tracking");
+        
+        // Return the last cached stats without any updates
+        final cachedDailyUsage = prefs.getDouble('cached_daily_usage_$today') ?? 0.0;
+        final cachedMaxSession = prefs.getDouble('cached_max_session_$today') ?? 0.0;
+        final cachedMostUnlockApp = prefs.getString('cached_most_unlock_app_$today') ?? 'None';
+        final cachedMostUnlockCount = prefs.getInt('cached_most_unlock_count_$today') ?? 0;
+        
+        return {
+          'daily_usage_hours': cachedDailyUsage,
+          'max_session': cachedMaxSession,
+          'current_session': 0.0, // No active session during override
+          'longest_session_app': 'None',
+          'most_unlock_app': cachedMostUnlockApp,
+          'most_unlock_count': cachedMostUnlockCount,
+          'per_app_usage': {},
+        };
+      }
 
-      // Check for new day
+      // Check for new day - ONLY resets at midnight
       if (await _checkAndResetNewDay(today, prefs)) {
-        print("🌅 NEW DAY - Memory reset to 0");
+        print("🌅 NEW DAY - Stats reset (daily limit also unlocks)");
       }
 
       // Get last processed timestamp
@@ -37,10 +95,7 @@ class UsageService {
 
       print("\n🔍 Checking NEW events since: ${lookback.toString().substring(11, 19)}");
 
-      // Query ALL events (not filtered)
-      List<dynamic> events = await UsageStats.queryEvents(lookback, now);
-
-      // Get selected packages
+      // Get selected packages FIRST - we only track these apps
       final selectedPackages = selectedApps
           .map((a) => a['package']!)
           .where((p) => p.isNotEmpty)
@@ -50,6 +105,19 @@ class UsageService {
         for (var app in selectedApps)
           if (app['package']!.isNotEmpty) app['package']!: app['name']!
       };
+
+      // Query ALL events, but filter to ONLY selected apps
+      List<dynamic> allEvents = await UsageStats.queryEvents(lookback, now);
+      
+      // Filter events to ONLY selected apps (user requested this)
+      List<dynamic> events = allEvents.where((event) {
+        String? pkg = event.packageName;
+        return pkg != null && pkg.isNotEmpty && selectedPackages.contains(pkg);
+      }).toList();
+      
+      if (allEvents.length != events.length) {
+        print("📱 Filtered ${allEvents.length - events.length} events from non-selected apps");
+      }
 
       // ✅ Load UNIFIED per-app data (ALL apps share this)
       final perAppUsageJson = prefs.getString('per_app_usage_$today') ?? '{}';
@@ -87,6 +155,8 @@ class UsageService {
       // Load active session
       final activeAppKey = prefs.getString('active_app_$today');
       final activeStartMs = prefs.getInt('active_start_$today');
+      double activeAccumulatedSeconds =
+          prefs.getDouble('active_recorded_$today') ?? 0.0;
       
       String? currentActiveApp = activeAppKey;
       int? currentActiveStart = activeStartMs;
@@ -123,85 +193,175 @@ class UsageService {
             if (currentActiveApp != null && currentActiveStart != null) {
               double duration = (timestamp - currentActiveStart) / 1000.0;
               if (duration > 0 && duration < 7200) {
+                // ✅ Track ALL apps in database (for week-long tracking and LSTM)
                 perAppUsage[currentActiveApp] = (perAppUsage[currentActiveApp] ?? 0) + duration;
-                
                 if (duration > (perAppLongest[currentActiveApp] ?? 0)) {
                   perAppLongest[currentActiveApp] = duration;
                 }
-
                 processed.add('${currentActiveApp}_$currentActiveStart');
                 
-                // Only print if it's a selected app
-                if (selectedPackages.contains(currentActiveApp)) {
-                  print("   ➕ ${packageToName[currentActiveApp] ?? currentActiveApp}: +${(duration/60).toStringAsFixed(1)}m");
-                }
+                // Log usage (all events are from selected apps now)
+                print("   ➕ ${packageToName[currentActiveApp] ?? currentActiveApp}: +${(duration/60).toStringAsFixed(1)}m");
               }
             }
 
             // Start new session
             currentActiveApp = pkg;
             currentActiveStart = timestamp;
-            perAppUnlocks[pkg] = (perAppUnlocks[pkg] ?? 0) + 1;
-
-            if (selectedPackages.contains(pkg)) {
-              print("   🔓 ${packageToName[pkg] ?? pkg} opened (${perAppUnlocks[pkg]}x)");
-            }
+            activeAccumulatedSeconds = 0.0;
+            
+            // Track unlocks (all events are from selected apps now)
+            final oldCount = perAppUnlocks[pkg] ?? 0;
+            perAppUnlocks[pkg] = oldCount + 1;
+            print("   🔓🔓🔓 ${packageToName[pkg] ?? pkg} opened (${oldCount} → ${perAppUnlocks[pkg]} unlocks) 🔓🔓🔓");
           }
           // Event type 2 = MOVE_TO_BACKGROUND
           else if (eventType == 2 && currentActiveApp == pkg && currentActiveStart != null) {
-            double duration = (timestamp - currentActiveStart) / 1000.0;
-            if (duration > 0 && duration < 7200) {
-              perAppUsage[pkg] = (perAppUsage[pkg] ?? 0) + duration;
-              
-              if (duration > (perAppLongest[pkg] ?? 0)) {
-                perAppLongest[pkg] = duration;
+            double totalDuration = (timestamp - currentActiveStart) / 1000.0;
+            if (totalDuration > 0 && totalDuration < 7200) {
+              double delta = totalDuration - activeAccumulatedSeconds;
+              if (delta > 0) {
+                perAppUsage[pkg] = (perAppUsage[pkg] ?? 0) + delta;
+                print(
+                    "   ➕ ${packageToName[pkg] ?? pkg}: +${(delta / 60).toStringAsFixed(1)}m (finalizing session)");
               }
-
+              if (totalDuration > (perAppLongest[pkg] ?? 0)) {
+                perAppLongest[pkg] = totalDuration;
+              }
               processed.add('${pkg}_$currentActiveStart');
-              
-              if (selectedPackages.contains(pkg)) {
-                print("   ➕ ${packageToName[pkg] ?? pkg}: +${(duration/60).toStringAsFixed(1)}m");
-              }
             }
 
             currentActiveApp = null;
             currentActiveStart = null;
+            activeAccumulatedSeconds = 0.0;
           }
-        }
-
-        // Handle still-active session
-        if (currentActiveApp != null && currentActiveStart != null) {
-          double duration = (now.millisecondsSinceEpoch - currentActiveStart) / 1000.0;
-          if (duration > 0 && duration < 7200) {
-            perAppUsage[currentActiveApp] = (perAppUsage[currentActiveApp] ?? 0) + duration;
-            
-            if (duration > (perAppLongest[currentActiveApp] ?? 0)) {
-              perAppLongest[currentActiveApp] = duration;
-            }
-
-            if (selectedPackages.contains(currentActiveApp)) {
-              print("   🔄 ${packageToName[currentActiveApp] ?? currentActiveApp} active: +${(duration/60).toStringAsFixed(1)}m");
-            }
-          }
-        }
-
-        // Save unified database
-        await prefs.setString('per_app_usage_$today', json.encode(perAppUsage));
-        await prefs.setString('per_app_unlocks_$today', json.encode(perAppUnlocks));
-        await prefs.setString('per_app_longest_$today', json.encode(perAppLongest));
-        await prefs.setString('processed_$today', json.encode(processed.toList()));
-        await prefs.setInt('last_check_$today', now.millisecondsSinceEpoch);
-        
-        // Save active session state
-        if (currentActiveApp != null && currentActiveStart != null) {
-          await prefs.setString('active_app_$today', currentActiveApp);
-          await prefs.setInt('active_start_$today', currentActiveStart);
-        } else {
-          await prefs.remove('active_app_$today');
-          await prefs.remove('active_start_$today');
         }
       } else {
         print("⏸️ No new events");
+      }
+
+      // ✅ REAL-TIME TRACKING: Use currentForegroundApp to track ongoing usage
+      // This ensures we track usage even when user is continuously inside an app (no events fire)
+      final nowMs = now.millisecondsSinceEpoch;
+      
+      // ✅ CRITICAL FIX: Only track if currentForegroundApp is a SELECTED app
+      // If user is in ReFocus app or home screen, STOP tracking (don't use cached app)
+      String? activeApp = currentForegroundApp;
+      
+      // If current foreground app is NOT a selected app, finalize any active session
+      if (activeApp == null || !selectedPackages.contains(activeApp)) {
+        // User switched away from selected apps - finalize current session
+        if (currentActiveApp != null && currentActiveStart != null && selectedPackages.contains(currentActiveApp)) {
+          // Calculate final duration and add to usage
+          final double delta = (nowMs - lastCheck) / 1000.0;
+          if (delta > 0 && delta < 7200) {
+            perAppUsage[currentActiveApp] = (perAppUsage[currentActiveApp] ?? 0) + delta;
+            activeAccumulatedSeconds += delta;
+            
+            final double totalDuration = (nowMs - currentActiveStart) / 1000.0;
+            if (totalDuration > (perAppLongest[currentActiveApp] ?? 0)) {
+              perAppLongest[currentActiveApp] = totalDuration;
+            }
+            
+            print("   ⏸️ Finalizing ${packageToName[currentActiveApp] ?? currentActiveApp}: +${(delta / 60).toStringAsFixed(1)}m (user left selected apps)");
+          }
+          
+          // Clear active session
+          currentActiveApp = null;
+          currentActiveStart = null;
+          activeAccumulatedSeconds = 0.0;
+        }
+        
+        // Don't continue tracking - user is not on a selected app
+        activeApp = null;
+      }
+      
+      if (activeApp != null && selectedPackages.contains(activeApp)) {
+        // Get or initialize session start time
+        final int startReference = currentActiveStart ?? activeStartMs ?? nowMs;
+        
+        // If this is a brand new session (no stored start), initialize it
+        bool isNewSession = false;
+        if (currentActiveStart == null && activeStartMs == null) {
+          currentActiveApp = activeApp;
+          currentActiveStart = nowMs;
+          activeAccumulatedSeconds = 0.0;
+          isNewSession = true;
+          print("   🆕 Starting real-time tracking for ${packageToName[activeApp] ?? activeApp}");
+        } else {
+          currentActiveApp = activeApp;
+          if (currentActiveStart == null) {
+            currentActiveStart = startReference;
+          }
+        }
+        
+        // Calculate delta since last check
+        final int startForDelta = startReference > lastCheck ? startReference : lastCheck;
+        if (nowMs > startForDelta) {
+          final double deltaSeconds = (nowMs - startForDelta) / 1000.0;
+          if (deltaSeconds > 0 && deltaSeconds < 7200) {
+            perAppUsage[activeApp] =
+                (perAppUsage[activeApp] ?? 0) + deltaSeconds;
+            activeAccumulatedSeconds += deltaSeconds;
+
+            final double sessionTotalSeconds =
+                (nowMs - startReference) / 1000.0;
+            if (sessionTotalSeconds > (perAppLongest[activeApp] ?? 0)) {
+              perAppLongest[activeApp] = sessionTotalSeconds;
+            }
+
+            print(
+                "   🔄 ${packageToName[activeApp] ?? activeApp} active: +${(deltaSeconds / 60).toStringAsFixed(1)}m (real-time${isNewSession ? ', NEW SESSION' : ''})");
+          }
+        }
+      }
+
+      // Save unified database and session state
+      await prefs.setString('per_app_usage_$today', json.encode(perAppUsage));
+      await prefs.setString('per_app_unlocks_$today', json.encode(perAppUnlocks));
+      await prefs.setString('per_app_longest_$today', json.encode(perAppLongest));
+      await prefs.setString('processed_$today', json.encode(processed.toList()));
+      await prefs.setInt('last_check_$today', nowMs);
+
+      if (currentActiveApp != null && currentActiveStart != null) {
+        await prefs.setString('active_app_$today', currentActiveApp);
+        await prefs.setInt('active_start_$today', currentActiveStart);
+        await prefs.setDouble('active_recorded_$today', activeAccumulatedSeconds);
+        
+        // CRITICAL: Check for active cooldown FIRST (prevents session restart during lock)
+        final cooldownEnd = prefs.getInt('cooldown_end');
+        final hasCooldown = cooldownEnd != null && DateTime.now().millisecondsSinceEpoch < cooldownEnd;
+        
+        // CRITICAL: Also update LockStateManager session tracking
+        // This ensures session limit checking works in real-time
+        // BUT ONLY if updateSessionTracking is true AND no cooldown is active
+        if (updateSessionTracking && !hasCooldown) {
+          try {
+            // Check if session tracking exists in LockStateManager
+            final sessionStart = prefs.getInt('session_start_$today');
+            if (sessionStart == null) {
+              // Initialize session tracking if it doesn't exist
+              await prefs.setInt('session_start_$today', currentActiveStart);
+              await prefs.setInt('last_activity_$today', nowMs);
+              print("   ✅ Session tracking initialized (start: ${DateTime.fromMillisecondsSinceEpoch(currentActiveStart).toString().substring(11, 19)})");
+            } else {
+              // Update last activity time to keep session alive
+              await prefs.setInt('last_activity_$today', nowMs);
+              final sessionMinutes = (nowMs - sessionStart) / 1000 / 60;
+              print("   ✅ Session tracking updated (${sessionMinutes.toStringAsFixed(1)}m total)");
+            }
+          } catch (e) {
+            print("   ⚠️ Error updating session tracking: $e");
+          }
+        } else if (hasCooldown) {
+          print("   🔒 Session tracking SKIPPED (cooldown active - preventing restart)");
+        } else {
+          print("   🔒 Session tracking SKIPPED (updateSessionTracking=false)");
+        }
+      } else {
+        await prefs.remove('active_app_$today');
+        await prefs.remove('active_start_$today');
+        await prefs.remove('active_recorded_$today');
       }
 
       // ✅ RECALCULATE totals from unified database for SELECTED apps only
@@ -229,17 +389,22 @@ class UsageService {
         if (count > maxUnlocks) {
           maxUnlocks = count;
           mostUnlocked = packageToName[pkg] ?? _getAppNameFromPackage(pkg);
+          print("   🏆🏆🏆 NEW MOST UNLOCKED: ${packageToName[pkg] ?? pkg} (${count}x unlocks) 🏆🏆🏆");
         }
 
-        if (usage > 0) {
+        if (usage > 0 || count > 0) {
           print("   ${packageToName[pkg] ?? pkg}: ${(usage/60).toStringAsFixed(1)}m (${count}x unlocks)");
         }
       }
 
       double hours = totalSeconds / 3600;
+      
+      // ✅ Get current global session time from LockStateManager
+      final currentSessionMins = await LockStateManager.getCurrentSessionMinutes();
 
       print("\n✅ FINAL TOTALS (Selected Apps Only):");
       print("   Total: ${(totalSeconds/60).toStringAsFixed(1)}m");
+      print("   Current Session: ${currentSessionMins.toStringAsFixed(1)}m (global)");
       print("   Longest: $longestApp (${longestSessionMins.toStringAsFixed(1)}m)");
       print("   Most Unlocked: $mostUnlocked ($maxUnlocks times)");
 
@@ -252,16 +417,19 @@ class UsageService {
         'most_unlock_count': maxUnlocks,
       });
 
+      // ✅ Save selected apps to database for week-long tracking and LSTM training
+      // Only selected apps are tracked now (as per user request)
       await DatabaseHelper.instance.saveDetailedAppUsage(
         date: today,
-        appUsage: perAppUsage,
-        appUnlocks: perAppUnlocks,
-        appLongestSessions: perAppLongest,
+        appUsage: perAppUsage, // Selected apps only
+        appUnlocks: perAppUnlocks, // Selected apps only
+        appLongestSessions: perAppLongest, // Selected apps only
       );
 
       return {
         "daily_usage_hours": hours,
         "max_session": longestSessionMins,
+        "current_session": currentSessionMins, // ✅ Current global session
         "longest_session_app": longestApp,
         "most_unlock_app": mostUnlocked,
         "most_unlock_count": maxUnlocks,
@@ -290,6 +458,7 @@ class UsageService {
       await prefs.setString('processed_$today', '[]');
       await prefs.remove('active_app_$today');
       await prefs.remove('active_start_$today');
+      await prefs.remove('active_recorded_$today');
       await prefs.setInt('last_check_$today',
         DateTime(DateTime.now().year, DateTime.now().month, DateTime.now().day)
             .millisecondsSinceEpoch
@@ -369,13 +538,28 @@ class UsageService {
       }
     }
 
-    return {
-      "daily_usage_hours": totalSeconds / 3600,
+    // Get current global session time
+    final currentSessionMins = await LockStateManager.getCurrentSessionMinutes();
+    
+    final totalHours = totalSeconds / 3600;
+
+    final result = {
+      "daily_usage_hours": totalHours,
       "max_session": longestSessionMins,
+      "current_session": currentSessionMins, // ✅ Current global session
       "longest_session_app": longestApp,
       "most_unlock_app": mostUnlocked,
       "most_unlock_count": maxUnlocks,
     };
+    
+    // ✅ Cache current stats for Emergency Override (so stats stay frozen when override is ON)
+    final todayStr = DateTime.now().toIso8601String().substring(0, 10);
+    await prefs.setDouble('cached_daily_usage_$todayStr', totalHours);
+    await prefs.setDouble('cached_max_session_$todayStr', longestSessionMins);
+    await prefs.setString('cached_most_unlock_app_$todayStr', mostUnlocked);
+    await prefs.setInt('cached_most_unlock_count_$todayStr', maxUnlocks);
+    
+    return result;
   }
 
   static String _getAppNameFromPackage(String packageName) {

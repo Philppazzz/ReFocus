@@ -2,8 +2,10 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:refocus_app/database_helper.dart';
+import 'package:refocus_app/services/auth_service.dart';
 import 'package:refocus_app/pages/terms_page.dart';
 import 'package:refocus_app/pages/intro_page.dart';
+import 'package:refocus_app/pages/pin_setup_page.dart';
 
 
 class SignupPage extends StatefulWidget {
@@ -70,11 +72,12 @@ bool _isValidName(String name) {
       return;
     }
 
-    // Save user to database
+    // Save user to database with hashed password (SECURE)
+    final hashedPassword = AuthService.hashPassword(password);
     await db.insertUser({
       'fullName': name,
       'email': email,
-      'password': password,
+      'password': hashedPassword, // Store hashed password, not plain text
     });
 
     //Make the loading stop
@@ -84,11 +87,23 @@ bool _isValidName(String name) {
       const SnackBar(content: Text("Account created successfully!")),
     );
 
-    // Go to login page
-    Navigator.pushReplacement(
-      context,
-      MaterialPageRoute(builder: (context) => const IntroPage()),
-    );
+    // Go to PIN setup page (optional)
+    if (mounted) {
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (context) => PINSetupPage(email: email),
+        ),
+      ).then((_) {
+        // After PIN setup, go to login page
+        if (mounted) {
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(builder: (context) => const IntroPage()),
+          );
+        }
+      });
+    }
   }
   
   // Sign Up Part and form and buttons
@@ -97,14 +112,14 @@ bool _isValidName(String name) {
     return Scaffold(
       backgroundColor: const Color(0xFFF5F6FA),
       body: SafeArea(
-        child: Padding(
+        child: SingleChildScrollView(
           padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 40),
           child: Form(
             key: _formKey,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.center,
               children: [
-                const SizedBox(height: 70),
+                const SizedBox(height: 20),
 
                 Text(
                   "Sign Up",

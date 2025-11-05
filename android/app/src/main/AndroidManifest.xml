@@ -2,52 +2,56 @@
     xmlns:tools="http://schemas.android.com/tools"
     package="com.example.refocus_app">
 
-    <!-- Permissions -->
-    <uses-permission
-        android:name="android.permission.QUERY_ALL_PACKAGES"
-        tools:ignore="QueryAllPackagesPermission" />
-    <uses-permission
-        android:name="android.permission.PACKAGE_USAGE_STATS"
+    <!-- ✅ Permissions -->
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
         tools:ignore="ProtectedPermissions" />
-    <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.REORDER_TASKS" />
-    <uses-permission android:name="android.permission.GET_TASKS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- POST_NOTIFICATIONS is only required for Android 13+ (API 33+), but declaring it here is safe for all versions -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- USE_FULL_SCREEN_INTENT is required for Android 12+ (API 31+) to show full-screen notifications -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <!-- Location permissions for emergency unlock geofence -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
-    <!-- Declare apps your app can detect -->
+    <!-- ✅ Let your app detect specific social apps -->
     <queries>
-        <package android:name="com.pinterest" />
-        <package android:name="com.linkedin.android" />
         <package android:name="com.facebook.katana" />
+        <package android:name="com.facebook.lite" />
         <package android:name="com.instagram.android" />
         <package android:name="com.twitter.android" />
         <package android:name="com.snapchat.android" />
         <package android:name="com.tiktok.android" />
         <package android:name="com.zhiliaoapp.musically" />
         <package android:name="com.whatsapp" />
-        <package android:name="com.facebook.orca" />
         <package android:name="org.telegram.messenger" />
         <package android:name="com.discord" />
         <package android:name="com.reddit.frontpage" />
         <package android:name="com.viber.voip" />
-        <package android:name="com.tencent.mm" />
-        <package android:name="com.bereal.ft" />
         <package android:name="com.google.android.youtube" />
         <package android:name="com.google.android.apps.youtube.music" />
-        <package android:name="com.instagram.barcelona" />
+        <package android:name="com.linkedin.android" />
+        <package android:name="com.bereal.ft" />
+        <package android:name="com.pinterest" />
         <package android:name="com.tumblr" />
         <package android:name="com.clubhouse.app" />
+        <package android:name="com.instagram.barcelona" />
     </queries>
 
     <application
-        android:label="ReFocus"
         android:name="${applicationName}"
+        android:label="ReFocus"
         android:icon="@mipmap/ic_launcher"
         android:usesCleartextTraffic="true"
         android:networkSecurityConfig="@xml/network_security_config"
@@ -61,7 +65,6 @@
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|screenLayout|uiMode"
             android:hardwareAccelerated="true"
             android:windowSoftInputMode="adjustResize"
-            android:excludeFromRecents="false"
             android:showOnLockScreen="true"
             android:turnScreenOn="true">
 
@@ -71,13 +74,43 @@
             </intent-filter>
         </activity>
 
-        <!-- Flutter metadata -->
+        <!-- ✅ Lock Screen Overlay Activity (Android 11+ compatible, shows on top of all apps) -->
+        <activity
+            android:name=".LockScreenOverlayActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:launchMode="singleInstance"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:showOnLockScreen="true"
+            android:turnScreenOn="true" />
+
         <meta-data
             android:name="io.flutter.embedding.android.NormalTheme"
             android:resource="@style/NormalTheme" />
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
-    </application>
 
+        <!-- ✅ Foreground Service for background monitoring -->
+        <service
+            android:name="com.pravera.flutter_foreground_task.service.ForegroundService"
+            android:foregroundServiceType="dataSync"
+            android:exported="false"
+            android:stopWithTask="false" />
+
+        <!-- ✅ Boot Receiver to restart service after device reboot -->
+        <receiver
+            android:name=".BootReceiver"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.RECEIVE_BOOT_COMPLETED">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </receiver>
+
+    </application>
 </manifest>

@@ -12,8 +12,12 @@ android {
 
     defaultConfig {
         applicationId = "com.example.refocus_app"
-        minSdk = flutter.minSdkVersion
-        targetSdk = 36  // ✅ Match the latest compileSdk
+        // ✅ ANDROID COMPATIBILITY:
+        // - minSdk 21 (Android 5.0+): Supports 95%+ of devices
+        // - targetSdk 36 (Android 15+): Latest Android version
+        // - Features work on Android 5.0+, optimized for Android 11-15
+        minSdk = flutter.minSdkVersion  // Android 5.0 (Lollipop) - broad compatibility
+        targetSdk = 36  // Android 15 (latest)
         versionCode = flutter.versionCode
         versionName = flutter.versionName
     }
