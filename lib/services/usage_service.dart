@@ -79,6 +79,85 @@ class UsageService {
           'per_app_usage': {},
         };
       }
+      
+      // ✅ CRITICAL: If there's an active cooldown or daily lock, skip ALL tracking
+      // This prevents usage/unlocks from accumulating while user is locked out
+      final cooldownEnd = prefs.getInt('cooldown_end');
+      final hasCooldown = cooldownEnd != null && DateTime.now().millisecondsSinceEpoch < cooldownEnd;
+      final dailyLocked = prefs.getBool('daily_locked') ?? false;
+      
+      if (hasCooldown || dailyLocked) {
+        print("🔒 LOCK ACTIVE - Skipping all tracking (cooldown: $hasCooldown, daily: $dailyLocked)");
+        
+        // Return current stats WITHOUT processing any new events
+        final perAppUsageJson = prefs.getString('per_app_usage_$today') ?? '{}';
+        Map<String, double> perAppUsage = {};
+        try {
+          perAppUsage = Map<String, double>.from(
+            json.decode(perAppUsageJson).map((k, v) => MapEntry(k as String, (v as num).toDouble()))
+          );
+        } catch (e) {
+          print("⚠️ Error loading per_app_usage: $e");
+        }
+        
+        final perAppUnlocksJson = prefs.getString('per_app_unlocks_$today') ?? '{}';
+        Map<String, int> perAppUnlocks = {};
+        try {
+          perAppUnlocks = Map<String, int>.from(json.decode(perAppUnlocksJson));
+        } catch (e) {
+          print("⚠️ Error loading per_app_unlocks: $e");
+        }
+        
+        final perAppLongestJson = prefs.getString('per_app_longest_$today') ?? '{}';
+        Map<String, double> perAppLongest = {};
+        try {
+          perAppLongest = Map<String, double>.from(
+            json.decode(perAppLongestJson).map((k, v) => MapEntry(k as String, (v as num).toDouble()))
+          );
+        } catch (e) {
+          print("⚠️ Error loading per_app_longest: $e");
+        }
+        
+        // Calculate totals from existing data
+        double totalSeconds = 0.0;
+        double longestSessionMins = 0.0;
+        String longestApp = 'None';
+        String mostUnlocked = 'None';
+        int maxUnlocks = 0;
+        
+        for (var entry in perAppUsage.entries) {
+          totalSeconds += entry.value;
+        }
+        
+        for (var entry in perAppLongest.entries) {
+          if (entry.value > longestSessionMins * 60) {
+            longestSessionMins = entry.value / 60;
+            longestApp = entry.key;
+          }
+        }
+        
+        for (var entry in perAppUnlocks.entries) {
+          if (entry.value > maxUnlocks) {
+            maxUnlocks = entry.value;
+            mostUnlocked = entry.key;
+          }
+        }
+        
+        final packageToName = {
+          for (var app in selectedApps)
+            if (app['package']!.isNotEmpty) app['package']!: app['name']!
+        };
+        
+        return {
+          'daily_usage_hours': totalSeconds / 3600,
+          'max_session': longestSessionMins,
+          'current_session': 0.0,
+          'longest_session_app': packageToName[longestApp] ?? longestApp,
+          'most_unlock_app': packageToName[mostUnlocked] ?? mostUnlocked,
+          'most_unlock_count': maxUnlocks,
+          'per_app_usage': perAppUsage,
+        };
+      }
 
       // Check for new day - ONLY resets at midnight
       if (await _checkAndResetNewDay(today, prefs)) {
@@ -184,11 +263,18 @@ class UsageService {
               ? int.parse(event.eventType)
               : event.eventType as int;
 
+          // ✅ CRITICAL: Use consistent session ID format to prevent duplicate processing
           String sessionId = '${pkg}_$timestamp';
-          if (processed.contains(sessionId)) continue;
+          if (processed.contains(sessionId)) {
+            print("   ⏭️ Skipping already processed event: $sessionId");
+            continue;
+          }
 
           // Event type 1 = MOVE_TO_FOREGROUND
           if (eventType == 1) {
+            // ✅ CRITICAL: Mark this event as processed IMMEDIATELY to prevent double-counting
+            processed.add(sessionId);
+            
             // Close previous session if exists
             if (currentActiveApp != null && currentActiveStart != null) {
               double duration = (timestamp - currentActiveStart) / 1000.0;
@@ -198,7 +284,6 @@ class UsageService {
                 if (duration > (perAppLongest[currentActiveApp] ?? 0)) {
                   perAppLongest[currentActiveApp] = duration;
                 }
-                processed.add('${currentActiveApp}_$currentActiveStart');
                 
                 // Log usage (all events are from selected apps now)
                 print("   ➕ ${packageToName[currentActiveApp] ?? currentActiveApp}: +${(duration/60).toStringAsFixed(1)}m");
@@ -217,6 +302,9 @@ class UsageService {
           }
           // Event type 2 = MOVE_TO_BACKGROUND
           else if (eventType == 2 && currentActiveApp == pkg && currentActiveStart != null) {
+            // ✅ CRITICAL: Mark this event as processed IMMEDIATELY
+            processed.add(sessionId);
+            
             double totalDuration = (timestamp - currentActiveStart) / 1000.0;
             if (totalDuration > 0 && totalDuration < 7200) {
               double delta = totalDuration - activeAccumulatedSeconds;
@@ -228,7 +316,6 @@ class UsageService {
               if (totalDuration > (perAppLongest[pkg] ?? 0)) {
                 perAppLongest[pkg] = totalDuration;
               }
-              processed.add('${pkg}_$currentActiveStart');
             }
 
             currentActiveApp = null;

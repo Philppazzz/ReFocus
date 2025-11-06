@@ -81,7 +81,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void dispose() {
     _refreshTimer?.cancel();
     _cooldownChecker?.cancel();
-    MonitorService.stopMonitoring();
+    // ✅ CRITICAL: DO NOT stop monitoring when HomePage is disposed
+    // Monitoring must continue in background even when app is closed
+    // MonitorService.stopMonitoring(); // REMOVED - monitoring continues
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -945,7 +947,7 @@ class AboutPage extends StatelessWidget {
                 shape: BoxShape.circle,
                 boxShadow: [
                   BoxShadow(
-                    color: const Color(0xFF6366F1).withOpacity(0.3),
+                    color: const Color.fromARGB(255, 13, 13, 29).withOpacity(0.3),
                     blurRadius: 20,
                     offset: const Offset(0, 10),
                   ),

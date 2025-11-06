@@ -4,7 +4,7 @@ import 'package:refocus_app/database_helper.dart';
 class LockStateManager {
   // Default thresholds (can be overridden via SharedPreferences)
   // ✅ TESTING MOST_UNLOCK: Set session and daily VERY HIGH to focus on unlock testing
-  static const double DEFAULT_DAILY_LIMIT_HOURS = 0.0183; // ~1 minute 10 seconds (1.1667 minutes)
+static const double DEFAULT_DAILY_LIMIT_HOURS = 0.0194; // 1 minute 10 seconds
 static const double DEFAULT_SESSION_LIMIT_MINUTES = 0.3333; // 20 seconds
 static const int DEFAULT_UNLOCK_LIMIT = 5; // stays the same for testing
 
@@ -216,13 +216,34 @@ static const int DEFAULT_UNLOCK_LIMIT = 5; // stays the same for testing
   /// - For session: reset session timer to 0
   /// - For unlock: set unlock base so next count starts at 0 relative
   /// - Also resets warning flags so warnings can be shown again after cooldown
+  /// Called after a violation is applied to reset appropriate counters
+  /// 
+  /// CRITICAL TRACKING RULES:
+  /// 1. DAILY USAGE: Never resets except at midnight - accumulates across all sessions
+  /// 2. SESSION TIMER: Resets only on session violation or cooldown end - tracks continuous usage
+  /// 3. UNLOCK COUNTER: Resets only on unlock violation - uses relative base to track from zero
+  /// 
+  /// Each violation type handles ONLY its own counter:
+  /// - Session violation: Reset session timer only (daily usage continues accumulating)
+  /// - Unlock violation: Set unlock base only (daily usage continues accumulating)
+  /// - Daily violation: Nothing resets, everything locked until midnight
   static Future<void> onViolationApplied({
     required String limitType,
     required int currentMostUnlockedCount,
   }) async {
     final prefs = await SharedPreferences.getInstance();
     final today = DateTime.now().toIso8601String().substring(0, 10);
+    final now = DateTime.now().millisecondsSinceEpoch;
 
+    // ✅ CRITICAL: Update last_check to NOW to skip all events during lock period
+    // This prevents usage/unlocks from accumulating while user is locked out
+    await prefs.setInt('last_check_$today', now);
+    print('⏭️ Updated last_check to NOW - events during lock will be skipped');
+
+    // Clear active app state (stops current tracking session)
+    await prefs.remove('active_app_$today');
+    await prefs.remove('active_start_$today');
+    
     if (limitType == 'session_limit') {
       // Log session end due to violation
       final sessionStartMs = prefs.getInt('session_start_$today');
@@ -234,26 +255,37 @@ static const int DEFAULT_UNLOCK_LIMIT = 5; // stays the same for testing
         );
       }
       
+      // Reset ONLY session-specific data (daily usage persists!)
       await prefs.remove('session_start_$today');
       await prefs.remove('last_activity_$today');
       await prefs.remove('session_accumulated_ms_$today');
-      // Reset warning flag so user can get warned again after cooldown
+      
+      // Reset session warning flags so they can trigger again after cooldown
       await prefs.remove('session_warning_sent_$today');
       await prefs.remove('session_warning_50_$today');
       await prefs.remove('session_warning_75_$today');
       await prefs.remove('session_warning_90_$today');
       await prefs.remove('session_final_warning_$today');
-      print('🔄 Session timer reset due to session violation');
+      
+      print('🔄 Session violation - Session timer reset (daily usage continues accumulating)');
     }
-    if (limitType == 'unlock_limit') {
+    else if (limitType == 'unlock_limit') {
+      // Set unlock base to current count (next violation will be relative to this)
       await prefs.setInt('unlock_base_$today', currentMostUnlockedCount);
-      // Reset warning flag so user can get warned again after cooldown
+      
+      // Reset unlock warning flags so they can trigger again after cooldown
       await prefs.remove('unlock_warning_sent_$today');
       await prefs.remove('unlock_warning_50_$today');
       await prefs.remove('unlock_warning_75_$today');
       await prefs.remove('unlock_warning_90_$today');
       await prefs.remove('unlock_final_warning_$today');
-      print('🔄 Unlock counter base set to $currentMostUnlockedCount');
+      
+      print('🔄 Unlock violation - Unlock base set to $currentMostUnlockedCount (daily usage continues accumulating)');
+    }
+    else if (limitType == 'daily_limit') {
+      // Daily limit: Nothing resets, all data persists until midnight
+      // Daily usage lock remains active until new day
+      print('🔒 Daily limit violation - All apps locked until midnight (all data persists, no resets)');
     }
   }
 
@@ -363,8 +395,21 @@ static const int DEFAULT_UNLOCK_LIMIT = 5; // stays the same for testing
         print("🔄 Session ended due to ${inactivityMinutes.toStringAsFixed(1)} min inactivity (threshold: ${inactivityThreshold.toStringAsFixed(1)} min). Active duration was ${sessionDurationMinutes.toStringAsFixed(1)} min. New session started.");
       } else {
         // Within threshold - add active time since last activity
+        // ✅ CRITICAL: Only add time if it's reasonable (< 2 seconds)
+        // This prevents adding large gaps when switching apps or reopening
         final deltaMs = now - lastActivityMs;
-        if (deltaMs > 0) accMs += deltaMs;
+        if (deltaMs > 0) {
+          // Only add time if delta is small (< 2 seconds = normal monitoring interval)
+          // Larger gaps mean user was away from selected apps
+          if (deltaMs <= 2000) {
+            accMs += deltaMs;
+            final deltaSec = deltaMs / 1000;
+            print("   ➕ Adding ${deltaSec.toStringAsFixed(1)}s to session (continuous usage)");
+          } else {
+            final deltaSec = deltaMs / 1000;
+            print("   ⏭️ Skipping ${deltaSec.toStringAsFixed(1)}s gap (user was away from selected apps)");
+          }
+        }
         final sessionMinutes = accMs / 1000 / 60;
         print("⏱️ Session continues (inactivity: ${inactivityMinutes.toStringAsFixed(1)} min < ${inactivityThreshold.toStringAsFixed(1)} min). Active: ${sessionMinutes.toStringAsFixed(1)} min");
       }
@@ -464,10 +509,9 @@ static const int DEFAULT_UNLOCK_LIMIT = 5; // stays the same for testing
     final remainingSeconds = ((cooldownEndMs - now) / 1000).ceil();
 
     if (remainingSeconds <= 0) {
-      await prefs.remove('cooldown_end');
-      await prefs.remove('cooldown_reason');
-      await prefs.remove('cooldown_app');
-      print("✅ Cooldown expired");
+      // Cooldown expired - call clearCooldown to properly clean up
+      print("✅ Cooldown expired - clearing cooldown state");
+      await clearCooldown();
       return null;
     }
 
@@ -517,6 +561,7 @@ static const int DEFAULT_UNLOCK_LIMIT = 5; // stays the same for testing
   static Future<void> clearCooldown() async {
     final prefs = await SharedPreferences.getInstance();
     final today = DateTime.now().toIso8601String().substring(0, 10);
+    final now = DateTime.now().millisecondsSinceEpoch;
     
     // Log session end due to cooldown completion (if session was active)
     final sessionStartMs = prefs.getInt('session_start_$today');
@@ -527,6 +572,11 @@ static const int DEFAULT_UNLOCK_LIMIT = 5; // stays the same for testing
         appsUsed: null,
       );
     }
+    
+    // ✅ CRITICAL: Update last_check to NOW when cooldown ends
+    // This ensures events during cooldown period are skipped
+    await prefs.setInt('last_check_$today', now);
+    print('⏭️ Updated last_check to NOW - events during cooldown skipped');
     
     await prefs.remove('cooldown_end');
     await prefs.remove('cooldown_reason');
@@ -541,7 +591,7 @@ static const int DEFAULT_UNLOCK_LIMIT = 5; // stays the same for testing
     await prefs.remove('unlock_final_warning_$today');
     // Note: daily_locked is NOT cleared here - it resets only at midnight
     // This allows daily limit to persist until next day
-    print("🔓 Cooldown cleared (session/unlock limits)");
+    print("🔓 Cooldown cleared (session/unlock limits) - tracking will resume from NOW");
   }
 
   /// Reset daily counters
