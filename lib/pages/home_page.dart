@@ -11,6 +11,7 @@ import 'package:refocus_app/services/selected_apps.dart';
 import 'package:refocus_app/pages/usage_statistics_page.dart';
 import 'package:refocus_app/pages/terms_page.dart';
 import 'package:refocus_app/database_helper.dart';
+import 'package:refocus_app/services/emergency_service.dart';
 
 /// ------------------- GLOBAL SINGLETON -------------------
 class AppState {
@@ -41,17 +42,26 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Map<String, dynamic>? _cooldownInfo;
   double _dailyLimitMinutes = 0.0;
   double _sessionLimitMinutes = 0.0;
+  double _todayUsageHours = 0.0;
+  double _yesterdayUsageHours = 0.0;
+  double _dailyImprovement = 0.0;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     
-    // ✅ CRITICAL: Reset Emergency Override on app startup to ensure clean state
-    AppState().isOverrideEnabled = false;
-    print("✅ Emergency Override reset to OFF on startup");
+    // ✅ CRITICAL: Sync Emergency Override state from SharedPreferences on startup
+    _syncEmergencyState();
     
     _initializeHome();
+  }
+  
+  Future<void> _syncEmergencyState() async {
+    final prefs = await SharedPreferences.getInstance();
+    final isEmergencyActive = prefs.getBool('emergency_override_enabled') ?? false;
+    AppState().isOverrideEnabled = isEmergencyActive;
+    print("✅ Emergency Override synced on startup: ${isEmergencyActive ? 'ON' : 'OFF'}");
   }
 
   Future<void> _initializeHome() async {
@@ -136,6 +146,41 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       final thresholds = await LockStateManager.getThresholds();
       final double dailyHours = (thresholds['dailyHours'] as num?)?.toDouble() ?? 0.0;
       final double sessionMinutes = (thresholds['sessionMinutes'] as num?)?.toDouble() ?? 0.0;
+      
+      // Calculate daily improvement
+      final todayHours = (newData['daily_usage_hours'] as num?)?.toDouble() ?? 0.0;
+      final db = DatabaseHelper.instance;
+      final yesterday = DateTime.now().subtract(const Duration(days: 1));
+      final yesterdayStats = await db.getTopApps(
+        startDate: yesterday.toIso8601String().substring(0, 10),
+        endDate: yesterday.toIso8601String().substring(0, 10),
+        limit: 100,
+      );
+      final yesterdayHours = yesterdayStats.fold<double>(
+        0.0,
+        (sum, app) => sum + ((app['total_usage_seconds'] as num?)?.toDouble() ?? 0.0) / 3600,
+      );
+      
+      double improvement = 0.0;
+      if (yesterdayHours > 0) {
+        improvement = ((yesterdayHours - todayHours) / yesterdayHours) * 100;
+      }
+      
+      // ✅ Calculate unlock delta for display (matches limit check logic)
+      // This shows "unlocks in current cycle" (0-5, then resets after violation)
+      final prefs = await SharedPreferences.getInstance();
+      final today = DateTime.now().toIso8601String().substring(0, 10);
+      final unlockBase = prefs.getInt('unlock_base_$today') ?? 0;
+      final totalUnlocks = (newData['most_unlock_count'] as num?)?.toInt() ?? 0;
+      final unlockDelta = (totalUnlocks - unlockBase).clamp(0, 999);
+      
+      // Add delta to stats for display
+      newData['unlock_count_delta'] = unlockDelta;
+      
+      print("🔍 Home Page Unlock Display:");
+      print("   Total unlocks today: $totalUnlocks");
+      print("   Base (from last violation): $unlockBase");
+      print("   Delta (current cycle): $unlockDelta / 5");
 
       if (mounted) {
         setState(() {
@@ -144,6 +189,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           _lastUpdateTime = _formatTime(DateTime.now());
           _dailyLimitMinutes = dailyHours * 60.0;
           _sessionLimitMinutes = sessionMinutes;
+          _todayUsageHours = todayHours;
+          _yesterdayUsageHours = yesterdayHours;
+          _dailyImprovement = improvement;
         });
       }
     } catch (e) {
@@ -192,7 +240,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     final totalUsageMinutes = (_usageStats?['daily_usage_hours'] ?? 0.0) * 60; // Convert to minutes
     final mostUnlockedApp = _usageStats?['most_unlock_app'] ?? "None";
-    final unlockCount = _usageStats?['most_unlock_count'] ?? 0;
+    // ✅ Show delta (current cycle: 0-5) instead of total
+    final unlockCount = _usageStats?['unlock_count_delta'] ?? (_usageStats?['most_unlock_count'] ?? 0);
 
     return Scaffold(
       appBar: AppBar(
@@ -321,11 +370,16 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                           color: Colors.black,
                         ),
                         const SizedBox(height: 24),
-                        const SizedBox(height: 8),
-                        // Button to view detailed statistics
+                        
+                        // Improvement Overview Text Box
+                        _buildImprovementOverview(),
+                        
+                        const SizedBox(height: 16),
+                        
+                        // "More details" button
                         SizedBox(
                           width: double.infinity,
-                          child: ElevatedButton.icon(
+                          child: OutlinedButton.icon(
                             onPressed: () {
                               Navigator.push(
                                 context,
@@ -334,16 +388,21 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                                 ),
                               );
                             },
-                            icon: const Icon(Icons.analytics),
-                            label: const Text("More details"),
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: const Color(0xFF6366F1),
-                              foregroundColor: Colors.white,
-                              padding: const EdgeInsets.symmetric(vertical: 16),
+                            icon: const Icon(Icons.bar_chart_rounded, size: 20),
+                            label: Text(
+                              'More details',
+                              style: GoogleFonts.inter(
+                                fontSize: 15,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: const Color(0xFF6366F1),
+                              side: const BorderSide(color: Color(0xFF6366F1), width: 1.5),
+                              padding: const EdgeInsets.symmetric(vertical: 14),
                               shape: RoundedRectangleBorder(
                                 borderRadius: BorderRadius.circular(12),
                               ),
-                              elevation: 2,
                             ),
                           ),
                         ),
@@ -502,6 +561,112 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     );
   }
 
+  Widget _buildImprovementOverview() {
+    if (_yesterdayUsageHours == 0 && _todayUsageHours == 0) {
+      return const SizedBox.shrink();
+    }
+    
+    final bool isImproving = _dailyImprovement > 0;
+    final bool isFirstDay = _yesterdayUsageHours == 0;
+    
+    // Format hours and minutes for display
+    final todayHours = _todayUsageHours.floor();
+    final todayMins = ((_todayUsageHours - todayHours) * 60).round();
+    final yesterdayHours = _yesterdayUsageHours.floor();
+    final yesterdayMins = ((_yesterdayUsageHours - yesterdayHours) * 60).round();
+    
+    final todayDisplay = todayHours > 0 ? '${todayHours}h ${todayMins}m' : '${todayMins}m';
+    final yesterdayDisplay = yesterdayHours > 0 ? '${yesterdayHours}h ${yesterdayMins}m' : '${yesterdayMins}m';
+    
+    // Simple improvement status
+    String statusText;
+    IconData icon;
+    Color borderColor;
+    Color bgColor;
+    Color textColor;
+    
+   if (isFirstDay) {
+  statusText = 'Tracking started — your progress begins today.';
+  icon = Icons.auto_awesome_rounded;
+  borderColor = const Color(0xFF6366F1);
+  bgColor = const Color(0xFF6366F1).withOpacity(0.08);
+  textColor = const Color(0xFF6366F1);
+} else if (isImproving) {
+  statusText = 'You’re showing good progress. Keep it up.';
+  icon = Icons.trending_up_rounded;
+  borderColor = const Color(0xFF10B981);
+  bgColor = const Color(0xFF10B981).withOpacity(0.08);
+  textColor = const Color(0xFF059669);
+} else {
+  statusText = 'Your screen time increased compared to before.';
+  icon = Icons.trending_down_rounded;
+  borderColor = const Color(0xFFEF4444);
+  bgColor = const Color(0xFFEF4444).withOpacity(0.08);
+  textColor = const Color(0xFFDC2626);
+}
+
+    
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: bgColor,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: borderColor.withOpacity(0.3),
+          width: 1.5,
+        ),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Icon
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: borderColor.withOpacity(0.15),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Icon(
+              icon,
+              color: textColor,
+              size: 24,
+            ),
+          ),
+          const SizedBox(width: 14),
+          // Text content
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  statusText,
+                  style: GoogleFonts.inter(
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.black87,
+                    height: 1.3,
+                  ),
+                ),
+                if (!isFirstDay) ...[
+                  const SizedBox(height: 6),
+                  Text(
+                    'Today: $todayDisplay • Yesterday: $yesterdayDisplay',
+                    style: GoogleFonts.inter(
+                      fontSize: 13,
+                      color: Colors.black54,
+                      height: 1.3,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildSessionProgressCard({
     required double currentMinutes,
     required double limitMinutes,
@@ -596,81 +761,146 @@ class _AppDrawerState extends State<AppDrawer> with SingleTickerProviderStateMix
       end: Colors.red.shade900,
     ).animate(_controller);
 
-    if (appState.isOverrideEnabled) {
-      _controller.repeat(reverse: true);
+    // Sync emergency state from SharedPreferences
+    _syncEmergencyState();
+  }
+  
+  Future<void> _syncEmergencyState() async {
+    final isActive = await EmergencyService.isEmergencyActive();
+    if (mounted) {
+      setState(() {
+        appState.isOverrideEnabled = isActive;
+        if (isActive) {
+          _controller.repeat(reverse: true);
+        }
+      });
     }
   }
 
-  void _toggleOverride() async {
-    final newState = !appState.isOverrideEnabled;
-    final prefs = await SharedPreferences.getInstance();
+  Future<void> _toggleOverride() async {
+    final context = this.context;
+    final isCurrentlyActive = await EmergencyService.isEmergencyActive();
     
-    setState(() {
-      appState.isOverrideEnabled = newState;
-      if (newState) {
-        _controller.repeat(reverse: true);
-      } else {
+    if (isCurrentlyActive) {
+      // Deactivate emergency
+      await EmergencyService.deactivateEmergency();
+      setState(() {
+        appState.isOverrideEnabled = false;
         _controller.stop();
-      }
-    });
-    
-    if (newState) {
-      // Override enabled
-      await prefs.setBool('emergency_override_enabled', true); // ✅ Sync with SharedPreferences
-      
-      // ✅ CRITICAL: Mark the timestamp when override is turned ON
-      // This will be used to skip all events that occur during override period
-      await prefs.setInt('emergency_override_start_time', DateTime.now().millisecondsSinceEpoch);
-      print("🚨 Emergency Override: ENABLED at ${DateTime.now().toString().substring(11, 19)}");
-      
-      // Cache current stats before stopping tracking
-      final currentStats = await UsageService.getUsageStatsWithEvents(
-        SelectedAppsManager.selectedApps,
-        updateSessionTracking: false,
-      );
-      final today = DateTime.now().toIso8601String().substring(0, 10);
-      await prefs.setDouble('cached_daily_usage_$today', currentStats['daily_usage_hours'] ?? 0.0);
-      await prefs.setDouble('cached_max_session_$today', currentStats['max_session'] ?? 0.0);
-      await prefs.setString('cached_most_unlock_app_$today', currentStats['most_unlock_app'] ?? 'None');
-      await prefs.setInt('cached_most_unlock_count_$today', currentStats['most_unlock_count'] ?? 0);
-      
-      LockStateManager.clearCooldown();
-      await prefs.remove('daily_locked'); // Clear daily lock too
-      MonitorService.clearLockState(); // Clear lock screen visibility
-      print("✅ Stats cached - will remain frozen while override is ON");
-      print("✅ All events during override period will be ignored when tracking resumes");
-    } else {
-      // Override disabled - restart monitoring
-      await prefs.setBool('emergency_override_enabled', false); // ✅ Sync with SharedPreferences
-      
-      // ✅ CRITICAL: Mark the timestamp when override is turned OFF
-      // Update last_check to NOW so events during override period are skipped
-      final overrideEndTime = DateTime.now().millisecondsSinceEpoch;
-      final today = DateTime.now().toIso8601String().substring(0, 10);
-      await prefs.setInt('last_check_$today', overrideEndTime);
-      await prefs.remove('emergency_override_start_time'); // Clean up
-      
-      print("🚨 Emergency Override: DISABLED at ${DateTime.now().toString().substring(11, 19)}");
-      print("✅ Events during override period will be skipped - tracking resumes from NOW");
-      
-      // ✅ CRITICAL: Restart monitoring and clear cache when override is disabled
-      print("🔄 Clearing cache and restarting monitoring...");
-      MonitorService.clearStatsCache(); // Clear any stale cache
-      
-      // Wait a moment to ensure state is updated
-      await Future.delayed(const Duration(milliseconds: 100));
-      
-      try {
-        await MonitorService.restartMonitoring();
-        print("✅ Monitoring restarted after Emergency Override disabled");
-        print("✅ AppState.isOverrideEnabled = ${AppState().isOverrideEnabled}");
-        print("✅ MonitorService.isMonitoring = ${MonitorService.isMonitoring}");
-      } catch (e) {
-        print("⚠️ Error restarting monitoring: $e");
-      }
+      });
+      widget.onRefresh();
+      return;
     }
     
-    widget.onRefresh();
+    // Check if already used today
+    if (await EmergencyService.hasUsedEmergencyToday()) {
+      final hoursUntil = await EmergencyService.getHoursUntilAvailable();
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Emergency override already used today. Available in $hoursUntil hours.'),
+            backgroundColor: Colors.orange,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
+      return;
+    }
+    
+    // Show confirmation dialog
+    if (context.mounted) {
+      final confirm = await showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => AlertDialog(
+          title: Row(
+            children: [
+              const Icon(Icons.warning_amber_rounded, color: Colors.orange, size: 30),
+              const SizedBox(width: 10),
+              const Text('Emergency Override'),
+            ],
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Are you sure you want to activate emergency override?',
+                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+              ),
+              const SizedBox(height: 16),
+              const Text('This will:'),
+              const SizedBox(height: 8),
+              const Text('✓ Remove all active locks'),
+              const Text('✓ Reset session timer'),
+              const Text('✓ Reset unlock counter'),
+              const Text('✓ Stop all tracking temporarily'),
+              const SizedBox(height: 12),
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.orange.withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.orange, width: 2),
+                ),
+                child: const Text(
+                  '⚠️ Can only be used ONCE per day',
+                  style: TextStyle(fontWeight: FontWeight.bold, color: Colors.orange),
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Note: Daily usage limit will still apply when you turn this off.',
+                style: TextStyle(fontSize: 12, color: Colors.grey),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.pop(context, true),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.orange,
+                foregroundColor: Colors.white,
+              ),
+              child: const Text('Confirm'),
+            ),
+          ],
+        ),
+      );
+      
+      if (confirm == true && context.mounted) {
+        // Activate emergency
+        final result = await EmergencyService.activateEmergency();
+        
+        if (result['success'] == true) {
+          setState(() {
+            appState.isOverrideEnabled = true;
+            _controller.repeat(reverse: true);
+          });
+          widget.onRefresh();
+          
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(result['message']),
+              backgroundColor: Colors.green,
+              duration: const Duration(seconds: 3),
+            ),
+          );
+        } else {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(result['message']),
+              backgroundColor: Colors.red,
+              duration: const Duration(seconds: 3),
+            ),
+          );
+        }
+      }
+    }
   }
 
   void _navigateTo(BuildContext context, Widget page) {

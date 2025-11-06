@@ -5,10 +5,10 @@ import 'dart:async';
 import 'package:refocus_app/services/lock_state_manager.dart';
 import 'package:refocus_app/services/monitor_service.dart';
 import 'package:refocus_app/pages/home_page.dart';
-import 'package:refocus_app/services/emergency_unlock_service.dart';
 import 'package:refocus_app/services/usage_service.dart';
 import 'package:refocus_app/services/selected_apps.dart';
 import 'package:refocus_app/database_helper.dart';
+import 'package:refocus_app/services/emergency_service.dart';
 
 class LockScreen extends StatefulWidget {
   final String reason;
@@ -478,6 +478,21 @@ class _EmergencyUnlockButtonState extends State<_EmergencyUnlockButton> {
   }
 
   Future<void> _showEmergencyUnlockDialog() async {
+    // Check if already used today
+    if (await EmergencyService.hasUsedEmergencyToday()) {
+      final hoursUntil = await EmergencyService.getHoursUntilAvailable();
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Emergency override already used today. Available in $hoursUntil hours.'),
+            backgroundColor: Colors.orange,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
+      return;
+    }
+
     bool isLoading = false;
 
     final result = await showDialog<bool>(
@@ -492,28 +507,42 @@ class _EmergencyUnlockButtonState extends State<_EmergencyUnlockButton> {
               Icon(Icons.warning_amber_rounded, color: Colors.orange, size: 28),
               const SizedBox(width: 12),
               const Text(
-                'Emergency Unlock',
+                'Emergency Override',
                 style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 20),
               ),
             ],
           ),
           content: Column(
             mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const Text(
-                'Are you sure you want to continue?',
-                style: TextStyle(color: Colors.white, fontSize: 16),
-                textAlign: TextAlign.center,
+                'Are you sure you want to activate emergency override?',
+                style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold),
               ),
+              const SizedBox(height: 16),
+              const Text('This will:', style: TextStyle(color: Colors.white)),
               const SizedBox(height: 8),
-              const Text(
-                'This will unlock all apps immediately.',
-                style: TextStyle(color: Colors.white70, fontSize: 14),
-                textAlign: TextAlign.center,
+              const Text('✓ Remove this lock', style: TextStyle(color: Colors.white70)),
+              const Text('✓ Reset session timer', style: TextStyle(color: Colors.white70)),
+              const Text('✓ Reset unlock counter', style: TextStyle(color: Colors.white70)),
+              const Text('✓ Stop all tracking', style: TextStyle(color: Colors.white70)),
+              const SizedBox(height: 12),
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.orange.withOpacity(0.2),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: Colors.orange, width: 2),
+                ),
+                child: const Text(
+                  '⚠️ Can only be used ONCE per day',
+                  style: TextStyle(fontWeight: FontWeight.bold, color: Colors.orange),
+                ),
               ),
               if (isLoading) ...[
                 const SizedBox(height: 20),
-                const CircularProgressIndicator(),
+                const Center(child: CircularProgressIndicator()),
               ],
             ],
           ),
@@ -530,26 +559,24 @@ class _EmergencyUnlockButtonState extends State<_EmergencyUnlockButton> {
                   ? null
                   : () async {
                       setState(() => isLoading = true);
-                      final unlockResult = await EmergencyUnlockService.performEmergencyUnlock(
-                        reason: 'Emergency unlock from lock screen',
-                      );
+                      final result = await EmergencyService.activateEmergency();
                       setState(() => isLoading = false);
-                      if (unlockResult['success'] == true) {
+                      if (result['success'] == true) {
                         Navigator.pop(context, true);
-                        Navigator.pop(context);
+                        Navigator.pop(context); // Close lock screen
                       } else {
                         ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(content: Text(unlockResult['message'] ?? 'Failed')),
+                          SnackBar(content: Text(result['message'] ?? 'Failed')),
                         );
                       }
                     },
               style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.red,
+                backgroundColor: Colors.orange,
                 foregroundColor: Colors.white,
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
               ),
               child: const Text(
-                'Proceed',
+                'Confirm',
                 style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
               ),
             ),
@@ -558,10 +585,10 @@ class _EmergencyUnlockButtonState extends State<_EmergencyUnlockButton> {
       ),
     );
 
-    if (result == true) {
+    if (result == true && context.mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Emergency unlock successful'),
+          content: Text('Emergency override activated successfully'),
           backgroundColor: Colors.green,
         ),
       );

@@ -10,7 +10,7 @@ static const int DEFAULT_UNLOCK_LIMIT = 5; // stays the same for testing
 
   // Progressive cooldowns for session/unlock violations
   // Punishment increases with each violation: 5s → 10s → 15s → 20s → 30s → 60s (then caps)
-  static const List<int> DEFAULT_COOLDOWN_TIERS_SECONDS = [5, 10, 15, 20, 30, 60];
+  static const List<int> DEFAULT_COOLDOWN_TIERS_SECONDS = [5, 10];
 
   // Legacy break model is no longer used; cooldown governs resets
   static const int BREAK_DURATION_MINUTES = 0;
@@ -133,6 +133,9 @@ static const int DEFAULT_UNLOCK_LIMIT = 5; // stays the same for testing
     
     if (exceeded) {
       print("🚨🚨🚨 UNLOCK LIMIT EXCEEDED: $delta unlocks >= $unlockLimit (base: $base, current: $currentMostUnlockedCount)");
+    } else if (delta > 0) {
+      // ✅ CRITICAL: Log when tracking is active (delta > 0 means unlocks are being counted)
+      print("✅ Unlock tracking ACTIVE: $delta unlocks counted (will lock at $unlockLimit)");
     }
     
     return exceeded;
@@ -558,10 +561,14 @@ static const int DEFAULT_UNLOCK_LIMIT = 5; // stays the same for testing
 
   /// Clear cooldown (only for session/unlock limits, NOT daily limit)
   /// Daily limit should only be cleared at midnight when new day resets
+  /// ✅ CRITICAL: After cooldown ends, tracking resumes immediately
   static Future<void> clearCooldown() async {
     final prefs = await SharedPreferences.getInstance();
     final today = DateTime.now().toIso8601String().substring(0, 10);
     final now = DateTime.now().millisecondsSinceEpoch;
+    
+    // ✅ CRITICAL: Get cooldown reason BEFORE removing it
+    final cooldownReason = prefs.getString('cooldown_reason');
     
     // Log session end due to cooldown completion (if session was active)
     final sessionStartMs = prefs.getInt('session_start_$today');
@@ -574,9 +581,27 @@ static const int DEFAULT_UNLOCK_LIMIT = 5; // stays the same for testing
     }
     
     // ✅ CRITICAL: Update last_check to NOW when cooldown ends
-    // This ensures events during cooldown period are skipped
+    // This ensures events during cooldown period are skipped for violation tracking
+    // BUT: Statistics tracking continues (events are still processed for screen time)
     await prefs.setInt('last_check_$today', now);
-    print('⏭️ Updated last_check to NOW - events during cooldown skipped');
+    print('⏭️ Updated last_check to NOW - events during cooldown skipped for violation tracking');
+    
+    // ✅ CRITICAL FIX: For unlock_limit cooldown, ensure unlock tracking resumes
+    // The unlock_base is already set correctly during violation
+    // After cooldown ends, tracking will resume and delta will be calculated correctly
+    if (cooldownReason == 'unlock_limit') {
+      final currentBase = prefs.getInt('unlock_base_$today') ?? 0;
+      print('🔄 Unlock cooldown ended - unlock counter will restart from 0');
+      print('   Unlock base preserved: $currentBase (tracking will resume immediately)');
+      print('   Next unlock will increment count, delta will be calculated from base');
+    }
+    
+    // ✅ CRITICAL FIX: For session_limit cooldown, ensure session tracking can resume
+    // Session tracking is already reset during violation, so it will start fresh
+    if (cooldownReason == 'session_limit') {
+      print('🔄 Session cooldown ended - session tracking will restart from 0');
+      print('   Session timer reset, new session will start when user opens selected app');
+    }
     
     await prefs.remove('cooldown_end');
     await prefs.remove('cooldown_reason');

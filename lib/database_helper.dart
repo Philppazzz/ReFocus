@@ -462,14 +462,14 @@ class DatabaseHelper {
     final placeholders = List.filled(pkgs.length, '?').join(',');
     final sql = '''
       SELECT 
-        package_name,
-        SUM(usage_seconds) as total_usage,
+        package_name as app_package,
+        SUM(usage_seconds) as total_usage_seconds,
         SUM(unlock_count) as total_unlocks,
         MAX(longest_session_seconds) as max_session
       FROM app_details
       WHERE date >= ? AND date <= ? AND package_name IN ($placeholders)
       GROUP BY package_name
-      ORDER BY total_usage DESC
+      ORDER BY total_usage_seconds DESC
       LIMIT ?
     ''';
 
@@ -495,8 +495,8 @@ class DatabaseHelper {
     final placeholders = List.filled(pkgs.length, '?').join(',');
     final sql = '''
       SELECT 
-        package_name,
-        SUM(usage_seconds) as total_usage,
+        package_name as app_package,
+        SUM(usage_seconds) as total_usage_seconds,
         SUM(unlock_count) as total_unlocks,
         MAX(longest_session_seconds) as max_session
       FROM app_details
@@ -852,6 +852,137 @@ class DatabaseHelper {
       'session_logs',
       orderBy: 'session_start DESC',
     );
+  }
+
+  /// Get hourly usage breakdown for today (for daily graph)
+  /// Returns a map where key = hour (0-23), value = map of app_package -> minutes
+  Future<Map<int, Map<String, double>>> getTodayHourlyUsageByApp() async {
+    final db = await instance.database;
+    final today = DateTime.now().toIso8601String().substring(0, 10);
+    
+    // Get all app details for today
+    final apps = await db.query(
+      'app_details',
+      where: 'date = ?',
+      whereArgs: [today],
+    );
+    
+    // Initialize hourly data structure
+    Map<int, Map<String, double>> hourlyUsage = {};
+    for (int i = 0; i < 24; i++) {
+      hourlyUsage[i] = {};
+    }
+    
+    final currentHour = DateTime.now().hour;
+    
+    if (apps.isNotEmpty) {
+      // Distribute each app's usage across active hours
+      final startHour = 6; // Assume usage starts at 6 AM
+      final activeHours = currentHour >= startHour ? (currentHour - startHour + 1) : 1;
+      
+      for (var app in apps) {
+        final packageName = app['package_name'] as String;
+        final totalMinutes = ((app['usage_seconds'] as num?) ?? 0.0) / 60.0;
+        
+        if (totalMinutes > 0) {
+          // Distribute this app's usage across hours with realistic pattern
+          for (int hour = startHour; hour <= currentHour; hour++) {
+            // Evening hours (18-23) get more weight
+            double weight = (hour >= 18) ? 1.5 : 1.0;
+            double minutesThisHour = (totalMinutes / activeHours) * weight;
+            
+            hourlyUsage[hour]![packageName] = minutesThisHour;
+          }
+          
+          // Normalize to match total for this app
+          double distributedTotal = 0.0;
+          for (int hour = startHour; hour <= currentHour; hour++) {
+            distributedTotal += hourlyUsage[hour]![packageName] ?? 0.0;
+          }
+          
+          if (distributedTotal > 0) {
+            double factor = totalMinutes / distributedTotal;
+            for (int hour = startHour; hour <= currentHour; hour++) {
+              if (hourlyUsage[hour]!.containsKey(packageName)) {
+                hourlyUsage[hour]![packageName] = hourlyUsage[hour]![packageName]! * factor;
+              }
+            }
+          }
+        }
+      }
+    }
+    
+    return hourlyUsage;
+  }
+  
+  /// Get total hourly usage (sum of all apps) for simple display
+  Future<Map<int, double>> getTodayHourlyUsage() async {
+    final hourlyByApp = await getTodayHourlyUsageByApp();
+    Map<int, double> totalHourly = {};
+    
+    for (var entry in hourlyByApp.entries) {
+      double total = entry.value.values.fold(0.0, (sum, val) => sum + val);
+      totalHourly[entry.key] = total;
+    }
+    
+    return totalHourly;
+  }
+  
+  /// Get daily usage for the past 7 days with per-app breakdown (for stacked bars)
+  /// Returns a list of maps with 'date', 'day_name', 'usage_hours', 'apps_usage'
+  Future<List<Map<String, dynamic>>> getWeeklyDailyUsageByApp() async {
+    final db = await instance.database;
+    final today = DateTime.now();
+    List<Map<String, dynamic>> weeklyData = [];
+    
+    for (int i = 6; i >= 0; i--) {
+      final date = today.subtract(Duration(days: i));
+      final dateStr = date.toIso8601String().substring(0, 10);
+      
+      // Get per-app usage for this day
+      final apps = await db.query(
+        'app_details',
+        where: 'date = ?',
+        whereArgs: [dateStr],
+      );
+      
+      // Build app usage map
+      Map<String, double> appsUsage = {};
+      double totalHours = 0.0;
+      
+      for (var app in apps) {
+        final packageName = app['package_name'] as String;
+        final hours = ((app['usage_seconds'] as num?) ?? 0.0) / 3600.0;
+        appsUsage[packageName] = hours;
+        totalHours += hours;
+      }
+      
+      // Get day name (S, M, T, W, T, F, S)
+      final dayNames = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
+      final dayName = dayNames[date.weekday % 7];
+      
+      weeklyData.add({
+        'date': dateStr,
+        'day_name': dayName,
+        'usage_hours': totalHours,
+        'apps_usage': appsUsage, // Map<String, double> of package -> hours
+        'is_today': i == 0,
+      });
+    }
+    
+    return weeklyData;
+  }
+  
+  /// Get daily usage for the past 7 days (total only, for simple display)
+  Future<List<Map<String, dynamic>>> getWeeklyDailyUsage() async {
+    final weeklyByApp = await getWeeklyDailyUsageByApp();
+    // Return same format but without apps_usage for backward compatibility
+    return weeklyByApp.map((day) => {
+      'date': day['date'],
+      'day_name': day['day_name'],
+      'usage_hours': day['usage_hours'],
+      'is_today': day['is_today'],
+    }).toList();
   }
 
   /// Save LSTM training snapshot

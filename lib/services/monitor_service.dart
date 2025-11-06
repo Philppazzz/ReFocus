@@ -272,11 +272,10 @@ class MonitorService {
   /// Check foreground app and enforce limits
   static Future<void> _checkForegroundApp() async {
     try {
-      // ✅ CRITICAL: If lock screen is visible, STOP all tracking to prevent usage accumulation
-      if (_lockVisible) {
-        print("🔒 Lock screen visible - PAUSING all tracking (preventing usage accumulation)");
-        return;
-      }
+      // ✅ CRITICAL: Check for active locks FIRST (before checking _lockVisible)
+      // This ensures locks are enforced even when app is closed/reopened
+      final cooldownInfo = await LockStateManager.getActiveCooldown();
+      final hasActiveLock = cooldownInfo != null;
       
       // ✅ CRITICAL: If Emergency Override is enabled, stop all tracking and skip violations
       final isOverrideEnabled = AppState().isOverrideEnabled;
@@ -285,15 +284,7 @@ class MonitorService {
         return; // Don't track usage, don't check violations, don't show lock screens
       }
       
-      // ✅ DEBUG: Log when override is OFF (only occasionally to avoid spam)
-      // Removed constant logging - only log when override is ON
-      
       final prefs = await SharedPreferences.getInstance();
-      
-      // DEBUG: Show current session status
-      final sessionMinutes = await LockStateManager.getCurrentSessionMinutes();
-      final isSessionLimitExceeded = await LockStateManager.isSessionLimitExceeded();
-      print("🔍 Session: ${sessionMinutes.toStringAsFixed(1)}m | Exceeded: $isSessionLimitExceeded");
       
       // Get current foreground app
       final foregroundApp = await platform.invokeMethod<String>('getForegroundApp');
@@ -328,39 +319,78 @@ class MonitorService {
       }
 
       // PRIORITY 1: Always enforce an active cooldown/lock - MOST CRITICAL
-      // This must work even when user is in other apps
-      // ALSO: Determine if session tracking should be updated (NO during cooldown)
-      final cooldownInfo = await LockStateManager.getActiveCooldown();
-      final hasActiveCooldown = cooldownInfo != null;
-      final updateSessionTracking = !hasActiveCooldown; // Only update session if no cooldown active
-      if (cooldownInfo != null) {
-        print("🔒 Active cooldown detected: ${cooldownInfo['reason']}");
+      // This must work even when user is in other apps or app is closed
+      // ✅ CRITICAL FIX: Check for active lock BEFORE checking _lockVisible
+      // This ensures lock screen appears even if app was closed and reopened
+      if (hasActiveLock) {
+        // cooldownInfo is guaranteed to be non-null when hasActiveLock is true
+        final lockInfo = cooldownInfo;
+        print("🔒 Active lock detected: ${lockInfo['reason']}");
         
-        // ALWAYS bring app to foreground if user is on ANY selected app (even if locked)
-        // This ensures lock screen appears reliably
-        if (isSelected && !isOwnApp) {
-          print("🚨 User on locked app - bringing ReFocus to front immediately");
+        // ✅ CRITICAL FIX: ALWAYS enforce lock when user is on a selected app
+        // This works even if app was closed/killed and reopened
+        // Don't check _lockVisible flag - force show every time to prevent bypass
+        if (isSelected) {
+          print("🚨 User on locked app ($foregroundApp) during ${lockInfo['reason']} - enforcing lock");
           await _bringAppToForeground();
-          await Future.delayed(const Duration(milliseconds: 500)); // Reduced delay for faster response
+          await Future.delayed(const Duration(milliseconds: 500));
+          
+          // ✅ CRITICAL: Always show lock screen when user is on selected app during lock
+          // Use force: true to bypass _lockVisible check and ensure it shows every time
+          Future.delayed(const Duration(milliseconds: 200), () {
+            _showLockScreen(lockInfo, force: true, allowBackNavigation: false);
+          });
         }
         
-        // ✅ CRITICAL: Only show lock screen when user tries to open selected apps
-        // Don't force show in ReFocus app - let user navigate freely to view stats
-        if (!_lockVisible) {
-          if (!isOwnApp && isSelected) {
-            // User is on a locked app - MUST show lock screen to block access
-            Future.delayed(const Duration(milliseconds: 200), () {
-              _showLockScreen(cooldownInfo, force: true, allowBackNavigation: false);
-            });
-          }
-          // ✅ REMOVED: Auto-showing lock screen in ReFocus app
-          // User can navigate freely in ReFocus to view stats, lock screen will show if they try selected apps
-        }
+        // ✅ CRITICAL: Don't return early - continue monitoring to catch app switches
+        // This ensures if user exits and reopens, lock screen appears again
+        // But skip violation checks and tracking during lock
         return; // Don't check for new violations if already locked
-      } else {
-        // No active cooldown - reset lock visibility flag
+      }
+      
+      // ✅ CRITICAL: Only check _lockVisible flag if no active lock
+      // If lock screen is visible but no active lock, clear it
+      if (_lockVisible && !hasActiveLock) {
+        print("🔒 Lock screen visible but no active lock - clearing lock state");
+        _lockVisible = false;
+      }
+      
+      // ✅ CRITICAL: If Emergency Override is enabled, stop all tracking and skip violations
+      // (Already checked above, but keeping for clarity)
+      
+      // DEBUG: Show current session status
+      final sessionMinutes = await LockStateManager.getCurrentSessionMinutes();
+      final isSessionLimitExceeded = await LockStateManager.isSessionLimitExceeded();
+      print("🔍 Session: ${sessionMinutes.toStringAsFixed(1)}m | Exceeded: $isSessionLimitExceeded");
+      
+      final updateSessionTracking = !hasActiveLock; // Only update session if no lock active
+      
+      // ✅ CRITICAL: Track cooldown state for cache clearing when cooldown ends
+      final wasInCooldown = prefs.getBool('_was_in_cooldown') ?? false;
+      if (hasActiveLock && !wasInCooldown) {
+        await prefs.setBool('_was_in_cooldown', true);
+      } else if (!hasActiveLock && wasInCooldown) {
+        // Cooldown just ended - will be handled below
+      }
+      
+      if (!hasActiveLock) {
+        // No active lock - reset lock visibility flag
         if (_lockVisible) {
           _lockVisible = false;
+        }
+        
+        // ✅ CRITICAL FIX: Clear stats cache when cooldown ends to ensure fresh unlock count
+        // This ensures unlock tracking resumes immediately after cooldown
+        // Check if we just transitioned from cooldown to no cooldown
+        if (wasInCooldown) {
+          print('🔄 Cooldown just ended - clearing cache and resuming unlock tracking');
+          clearStatsCache();
+          await prefs.setBool('_was_in_cooldown', false);
+          
+          // ✅ CRITICAL: Force immediate violation check after cooldown ends
+          // This ensures unlock limit is checked immediately when user opens apps
+          print('🔄 Forcing immediate violation check after cooldown ended');
+          // The check will happen naturally in the next lines, but we ensure cache is cleared
         }
       }
 
@@ -488,6 +518,8 @@ class MonitorService {
       // 1. Daily limit (most severe - locks until tomorrow)
       // 2. Session limit (medium - locks for cooldown)
       // 3. Unlock limit (medium - locks for cooldown)
+      // ✅ CRITICAL FIX: Must check unlock limit even if session limit is exceeded
+      // Both limits can trigger independently
       Map<String, dynamic>? violation;
       
       // Get thresholds first (for logging)
@@ -510,20 +542,33 @@ class MonitorService {
       print("   🔍 Foreground app: $foregroundApp | Is selected: $isSelected");
       print("   🔍 Checking unlock limit: $totalUnlocks unlocks (limit: ${thresholds['unlockLimit']})");
 
-      // Check limits using hybrid system: LSTM if enabled, fallback to rule-based
-      // This checks daily and unlock limits
-      violation = await LSTMBridge.checkLimitsHybrid(
-        dailyHours: dailyHours,
-        totalUnlocks: totalUnlocks,
-      );
+      // ✅ CRITICAL FIX: Check unlock limit FIRST (before daily/session) to ensure it's always checked
+      // This ensures unlock limit is checked independently of other limits
+      final isUnlockLimitExceeded = await LockStateManager.isUnlockLimitExceeded(totalUnlocks);
+      if (isUnlockLimitExceeded) {
+        violation = {
+          'type': 'unlock_limit',
+          'message': 'Unlock limit reached',
+        };
+        print("🚨🚨🚨 UNLOCK LIMIT EXCEEDED FIRST! 🚨🚨🚨");
+      }
       
-      // If no daily/unlock violation, check session limit
+      // Check daily limit (only if unlock limit not exceeded)
+      if (violation == null && await LockStateManager.isDailyLimitExceeded(dailyHours)) {
+        violation = {
+          'type': 'daily_limit',
+          'message': 'Daily limit reached - unlocks tomorrow',
+        };
+        print("🚨🚨🚨 DAILY LIMIT EXCEEDED! 🚨🚨🚨");
+      }
+      
+      // Check session limit (only if no other violation)
       if (violation == null && await LockStateManager.isSessionLimitExceeded()) {
         violation = {
           'type': 'session_limit',
           'message': 'Continuous usage limit reached',
         };
-        print("🚨 SESSION LIMIT EXCEEDED!");
+        print("🚨🚨🚨 SESSION LIMIT EXCEEDED! 🚨🚨🚨");
       }
 
       // PRIORITY 4: Handle violation if detected - MUST TRIGGER INSTANTLY
@@ -585,16 +630,13 @@ class MonitorService {
             cooldownSeconds: null, // Daily limit has no cooldown
           );
 
-          print("🔒 Daily lock activated (silent - will show when user tries selected app)");
+          print("🔒 Daily lock activated (will show when user tries selected app)");
 
-          // ✅ FIX: Don't show lock screen immediately!
-          // Instead, let PRIORITY 1 (active cooldown enforcement) handle it
-          // The lock screen will appear when user tries to open a selected app
-          // This prevents showing the lock screen when user is in ReFocus app or non-selected apps
-          
-          // ✅ CRITICAL: Only show lock screen when user tries to open selected apps
-          // Don't force show in ReFocus app - let user navigate freely to view stats
-          if (isSelected && !isOwnApp) {
+          // ✅ CRITICAL FIX: Always show lock screen when user opens selected app during daily lock
+          // This ensures user cannot bypass daily lock by exiting and reopening
+          // The lock screen will appear every time user tries to open a selected app
+          if (isSelected) {
+            print("🚨 User on locked app during daily limit ($foregroundApp) - enforcing lock");
             await _bringAppToForeground();
             await Future.delayed(const Duration(milliseconds: 500));
             
@@ -605,8 +647,6 @@ class MonitorService {
               'appName': appName,
             }, force: true, allowBackNavigation: false);
           }
-          // ✅ REMOVED: Auto-showing lock screen in ReFocus app for daily limit
-          // User can navigate freely in ReFocus to view stats, lock screen will show if they try selected apps
           
           return;
         }
@@ -688,15 +728,34 @@ class MonitorService {
   }
 
   static void _showLockScreen(Map<String, dynamic> cooldown, {bool force = false, bool allowBackNavigation = false}) {
-    // ✅ CRITICAL: Prevent duplicate lock screens to stop glitching timer
-    if (_lockVisible) {
+    // ✅ CRITICAL FIX: If force=true, always show lock screen (even if already visible)
+    // This ensures lock screen appears every time user opens selected app during lock
+    if (_lockVisible && !force) {
       print("⚠️ Lock screen already visible - BLOCKING duplicate (force=$force)");
       return;
+    }
+    
+    // If force=true and lock is already visible, reset the flag to allow re-showing
+    if (_lockVisible && force) {
+      print("🔄 Force showing lock screen - resetting visibility flag");
+      _lockVisible = false;
     }
     
     final navigator = Nav.navigatorKey.currentState;
     if (navigator == null) {
       print("⚠️ Navigator not available - cannot show lock screen");
+      // ✅ CRITICAL: If navigator is not available, try again after a short delay
+      // This handles the case where app is starting up or was closed/reopened
+      Future.delayed(const Duration(milliseconds: 500), () {
+        final retryNavigator = Nav.navigatorKey.currentState;
+        if (retryNavigator != null) {
+          print("✅ Navigator available on retry - showing lock screen");
+          _lockVisible = true;
+          retryNavigator.pushNamed('/lock', arguments: cooldown);
+        } else {
+          print("⚠️ Navigator still not available after retry");
+        }
+      });
       return;
     }
     
