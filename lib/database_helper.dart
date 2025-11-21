@@ -1,17 +1,26 @@
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
 import 'package:refocus_app/services/auth_service.dart';
-import 'package:refocus_app/services/selected_apps.dart';
+import 'package:refocus_app/utils/category_mapper.dart';
+import 'package:refocus_app/services/app_categorization_service.dart';
 
+/// Cleaned up database helper - only essential tables and methods
 class DatabaseHelper {
   static final DatabaseHelper instance = DatabaseHelper._init();
   static Database? _database;
 
   DatabaseHelper._init();
 
+  String _dateKey(DateTime date) {
+    final year = date.year.toString().padLeft(4, '0');
+    final month = date.month.toString().padLeft(2, '0');
+    final day = date.day.toString().padLeft(2, '0');
+    return '$year-$month-$day';
+  }
+
   Future<Database> get database async {
     if (_database != null) return _database!;
-    _database = await _initDB('refocus_unified.db');
+    _database = await _initDB('refocus.db');
     return _database!;
   }
 
@@ -19,104 +28,70 @@ class DatabaseHelper {
     final dbPath = await getDatabasesPath();
     final path = join(dbPath, filePath);
 
+    // ✅ PRODUCTION-SAFE: Only delete on version upgrade or corruption
+    // Check if database file exists
+    bool shouldDelete = false;
+    try {
+      // Try to open existing database to check version
+      final existingDb = await openDatabase(
+        path,
+        version: 3,
+        readOnly: true,
+        onOpen: (db) async {
+          // Database opened successfully
+        },
+      );
+      
+      try {
+        final version = await existingDb.getVersion();
+        await existingDb.close();
+        
+        // Only delete if version mismatch (upgrade scenario)
+        if (version < 3) {
+          print("🔄 Database version mismatch ($version < 3) - upgrading...");
+          shouldDelete = true;
+        } else {
+          print("✅ Database exists with correct version ($version)");
+        }
+      } catch (e) {
+        await existingDb.close();
+        // Version check failed - might be corrupted
+        print("⚠️ Error checking database version: $e - will recreate");
+        shouldDelete = true;
+      }
+    } catch (e) {
+      // Database doesn't exist or is corrupted - create new one
+      print("ℹ️ Database doesn't exist or can't be opened: $e");
+      shouldDelete = true;
+    }
+
+    if (shouldDelete) {
+      print("🗑️ Deleting old/corrupted database...");
+      try {
+        await deleteDatabase(path);
+        print("✅ Database deleted successfully");
+      } catch (e) {
+        print("ℹ️ No database to delete: $e");
+      }
+    } else {
+      print("✅ Using existing database (version 3)");
+    }
+
+    // Open database with migration support
     return await openDatabase(
       path,
-      version: 8,
+      version: 3,
       onCreate: _createDB,
       onUpgrade: (db, oldVersion, newVersion) async {
-        if (oldVersion < 4) {
-          // Drop old tables and recreate
-          await db.execute('DROP TABLE IF EXISTS usage_stats');
-          await db.execute('DROP TABLE IF EXISTS app_details');
-          
-          await db.execute('''
-            CREATE TABLE usage_stats (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              date TEXT NOT NULL UNIQUE,
-              daily_usage_hours REAL,
-              max_session REAL,
-              longest_session_app TEXT,
-              most_unlock_app TEXT,
-              most_unlock_count INTEGER
-            )
-          ''');
-
-          await db.execute('''
-            CREATE TABLE app_details (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              date TEXT NOT NULL,
-              package_name TEXT NOT NULL,
-              usage_seconds REAL,
-              unlock_count INTEGER,
-              longest_session_seconds REAL,
-              UNIQUE(date, package_name)
-            )
-          ''');
-        }
-        if (oldVersion < 5) {
-          // Add emergency_unlocks table
-          await db.execute('''
-            CREATE TABLE IF NOT EXISTS emergency_unlocks (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              timestamp INTEGER NOT NULL,
-              method TEXT NOT NULL,
-              reason TEXT,
-              location_latitude REAL,
-              location_longitude REAL,
-              trusted_contact_approved INTEGER DEFAULT 0,
-              abuse_penalty_applied INTEGER DEFAULT 0
-            )
-          ''');
-        }
-        if (oldVersion < 6) {
-          // Add violation_logs table
-          await db.execute('''
-            CREATE TABLE IF NOT EXISTS violation_logs (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              timestamp INTEGER NOT NULL,
-              violation_type TEXT NOT NULL,
-              app_name TEXT NOT NULL,
-              app_package TEXT,
-              daily_hours REAL,
-              session_minutes REAL,
-              unlock_count INTEGER,
-              cooldown_seconds INTEGER
-            )
-          ''');
-        }
-        if (oldVersion < 7) {
-          // Add session_logs table
-          await db.execute('''
-            CREATE TABLE IF NOT EXISTS session_logs (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              session_start INTEGER NOT NULL,
-              session_end INTEGER,
-              duration_minutes REAL,
-              ended_reason TEXT,
-              apps_used TEXT
-            )
-          ''');
-        }
-        if (oldVersion < 8) {
-          // Add lstm_training_snapshots table for LSTM model training data
-          await db.execute('''
-            CREATE TABLE IF NOT EXISTS lstm_training_snapshots (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              timestamp INTEGER NOT NULL,
-              daily_usage_hours REAL,
-              most_unlock_count INTEGER,
-              max_session_minutes REAL,
-              current_session_minutes REAL,
-              feature_vector TEXT,
-              snapshot_type TEXT DEFAULT 'periodic'
-            )
-          ''');
-        }
+        print("🔄 Upgrading database from version $oldVersion to $newVersion");
+        // For now, recreate tables (can be optimized later)
+        await _createDB(db, newVersion);
       },
     );
   }
 
   Future _createDB(Database db, int version) async {
+    // ============ USER AUTHENTICATION ============
     await db.execute('''
       CREATE TABLE users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -126,33 +101,51 @@ class DatabaseHelper {
       )
     ''');
 
-    // ✅ Main daily summary (what user sees - selected apps only)
+    // ============ CATEGORY-BASED SYSTEM ============
+
+    // Apps catalog - maps packages to categories
     await db.execute('''
-      CREATE TABLE usage_stats (
+      CREATE TABLE apps_catalog (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        date TEXT NOT NULL UNIQUE,
-        daily_usage_hours REAL,
-        max_session REAL,
-        longest_session_app TEXT,
-        most_unlock_app TEXT,
-        most_unlock_count INTEGER
+        package_name TEXT NOT NULL UNIQUE,
+        app_name TEXT,
+        category TEXT NOT NULL,
+        play_store_category TEXT,
+        is_monitored INTEGER DEFAULT 1,
+        last_updated INTEGER NOT NULL,
+        is_system_app INTEGER DEFAULT 0,
+        is_from_playstore INTEGER DEFAULT 0
       )
     ''');
 
-    // ✅ Detailed per-app tracking (ALL apps)
+    // Lock history - track category lock events
     await db.execute('''
-      CREATE TABLE app_details (
+      CREATE TABLE lock_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        date TEXT NOT NULL,
-        package_name TEXT NOT NULL,
-        usage_seconds REAL,
-        unlock_count INTEGER,
-        longest_session_seconds REAL,
-        UNIQUE(date, package_name)
+        timestamp INTEGER NOT NULL,
+        category TEXT NOT NULL,
+        lock_duration_seconds INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        violation_type TEXT
       )
     ''');
 
-    // ✅ Emergency unlock tracking
+    // Decision tree data - for ML training
+    await db.execute('''
+      CREATE TABLE decision_tree_data (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp INTEGER NOT NULL,
+        category TEXT NOT NULL,
+        daily_usage_seconds INTEGER,
+        current_session_seconds INTEGER,
+        session_count INTEGER,
+        time_of_day TEXT,
+        day_of_week TEXT,
+        should_lock INTEGER NOT NULL
+      )
+    ''');
+
+    // Emergency unlocks - security feature
     await db.execute('''
       CREATE TABLE emergency_unlocks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -166,75 +159,129 @@ class DatabaseHelper {
       )
     ''');
 
-    // ✅ Violation logs for tracking limit violations
-    await db.execute('''
-      CREATE TABLE violation_logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp INTEGER NOT NULL,
-        violation_type TEXT NOT NULL,
-        app_name TEXT NOT NULL,
-        app_package TEXT,
-        daily_hours REAL,
-        session_minutes REAL,
-        unlock_count INTEGER,
-        cooldown_seconds INTEGER
-      )
-    ''');
-
-    // ✅ Session logs for tracking continuous usage sessions
+    // Session logs - track app sessions
     await db.execute('''
       CREATE TABLE session_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_start INTEGER NOT NULL,
-        session_end INTEGER,
-        duration_minutes REAL,
-        ended_reason TEXT,
-        apps_used TEXT
+        package_name TEXT NOT NULL,
+        category TEXT NOT NULL,
+        start_time INTEGER NOT NULL,
+        end_time INTEGER,
+        duration_seconds INTEGER,
+        was_locked INTEGER DEFAULT 0
       )
     ''');
 
-    // ✅ LSTM training snapshots for model training data collection
+    // Usage stats - lightweight daily summary
     await db.execute('''
-      CREATE TABLE lstm_training_snapshots (
+      CREATE TABLE usage_stats (
+        date TEXT NOT NULL,
+        category TEXT NOT NULL,
+        total_usage_seconds INTEGER NOT NULL,
+        session_count INTEGER DEFAULT 0,
+        PRIMARY KEY (date, category)
+      ) WITHOUT ROWID
+    ''');
+
+    // App details - per-app usage tracking
+    await db.execute('''
+      CREATE TABLE app_details (
+        date TEXT NOT NULL,
+        package_name TEXT NOT NULL,
+        app_name TEXT,
+        category TEXT NOT NULL,
+        usage_seconds INTEGER NOT NULL,
+        unlock_count INTEGER DEFAULT 0,
+        PRIMARY KEY (date, package_name)
+      ) WITHOUT ROWID
+    ''');
+
+    // User feedback - for REAL ML training (not threshold-based)
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS user_feedback (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp INTEGER NOT NULL,
-        daily_usage_hours REAL,
-        most_unlock_count INTEGER,
-        max_session_minutes REAL,
-        current_session_minutes REAL,
-        feature_vector TEXT,
-        snapshot_type TEXT DEFAULT 'periodic'
+        app_name TEXT NOT NULL,
+        app_category TEXT NOT NULL,
+        package_name TEXT,
+        daily_usage_minutes INTEGER NOT NULL,
+        session_usage_minutes INTEGER NOT NULL,
+        time_of_day INTEGER NOT NULL,
+        day_of_week INTEGER NOT NULL,
+        was_helpful INTEGER NOT NULL,
+        user_override INTEGER NOT NULL,
+        lock_reason TEXT,
+        prediction_source TEXT,
+        model_confidence REAL,
+        is_test_data INTEGER DEFAULT 0
       )
     ''');
+    
+    // ✅ SAFE TESTING: Add is_test_data column if it doesn't exist (for existing databases)
+    try {
+      await db.execute('ALTER TABLE user_feedback ADD COLUMN is_test_data INTEGER DEFAULT 0');
+    } catch (e) {
+      // Column already exists, ignore error
+    }
+
+    // ✅ PROFESSIONAL METRICS: Training history for model analytics
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS ml_training_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp INTEGER NOT NULL,
+        training_samples INTEGER NOT NULL,
+        test_samples INTEGER NOT NULL,
+        accuracy REAL NOT NULL,
+        precision REAL NOT NULL,
+        recall REAL NOT NULL,
+        f1_score REAL NOT NULL,
+        train_accuracy REAL,
+        overfitting_detected INTEGER DEFAULT 0
+      )
+    ''');
+
+    // Create indexes for performance
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_apps_catalog_category ON apps_catalog(category)');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_lock_history_timestamp ON lock_history(timestamp)');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_decision_tree_timestamp ON decision_tree_data(timestamp)');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_session_logs_start ON session_logs(start_time)');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_usage_stats_date ON usage_stats(date)');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_app_details_date ON app_details(date)');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_feedback_timestamp ON user_feedback(timestamp)');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_feedback_category ON user_feedback(app_category)');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_training_history_timestamp ON ml_training_history(timestamp)');
+    
+    // ✅ CRITICAL: Add indexes for frequently queried columns
+    // These improve performance for getCategoryUsageForDate and similar queries
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_app_details_date_category ON app_details(date, category)');
+    await db.execute('CREATE INDEX IF NOT EXISTS idx_app_details_category ON app_details(category)');
   }
 
-  // ---------------- USER METHODS ----------------
+  // ============ USER METHODS ============
+
   Future<int> insertUser(Map<String, dynamic> user) async {
     final db = await instance.database;
     return await db.insert('users', user);
   }
 
-  /// Get user by email and verify password (secure - compares hashes)
   Future<Map<String, dynamic>?> getUser(String email, String password) async {
     final db = await instance.database;
-    
-    // First get user by email to retrieve stored password hash
+
     final result = await db.query(
       'users',
       where: 'email = ?',
       whereArgs: [email],
     );
-    
+
     if (result.isEmpty) return null;
-    
+
     final user = result.first;
     final storedPasswordHash = user['password'] as String?;
-    
+
     if (storedPasswordHash == null) return null;
-    
-    // Verify password by comparing hashes
+
     final isValid = AuthService.verifyPassword(password, storedPasswordHash);
-    
+
     return isValid ? user : null;
   }
 
@@ -248,11 +295,9 @@ class DatabaseHelper {
     return result.isNotEmpty;
   }
 
-  /// Update user password (secure - stores hashed password)
   Future<bool> updateUserPassword(String email, String newPassword) async {
     try {
       final db = await instance.database;
-      // Hash the new password before storing
       final hashedPassword = AuthService.hashPassword(newPassword);
       final result = await db.update(
         'users',
@@ -267,374 +312,183 @@ class DatabaseHelper {
     }
   }
 
-  // ---------------- UNIFIED USAGE TRACKING ----------------
-  
-  /// ✅ Save daily summary (REPLACES today's entry)
-  Future<void> saveUsageStats(Map<String, dynamic> stats) async {
-    final db = await instance.database;
-    final today = DateTime.now().toIso8601String().substring(0, 10);
+  // ============ APP CATALOG METHODS ============
 
-    await db.insert(
-      'usage_stats',
-      {
-        'date': today,
-        'daily_usage_hours': (stats['daily_usage_hours'] as num? ?? 0).toDouble(),
-        'max_session': (stats['max_session'] as num? ?? 0).toDouble(),
-        'longest_session_app': stats['longest_session_app'] ?? 'None',
-        'most_unlock_app': stats['most_unlock_app'] ?? 'None',
-        'most_unlock_count': (stats['most_unlock_count'] as int? ?? 0),
-      },
+  /// Insert a single app into the catalog
+  Future<int> insertAppCatalog(Map<String, dynamic> app) async {
+    final db = await instance.database;
+    return await db.insert(
+      'apps_catalog',
+      app,
       conflictAlgorithm: ConflictAlgorithm.replace,
     );
   }
 
-  /// ✅ Save detailed per-app usage (ALL apps - selected + unselected)
-  /// 
-  /// This saves data for ALL apps to enable:
-  /// - Week-long progress tracking
-  /// - LSTM model training on complete user behavior patterns
-  /// - Analytics and insights across all app usage
-  /// 
-  /// Note: Only selected apps count toward limits, but all apps are tracked for analysis
-  Future<void> saveDetailedAppUsage({
-    required String date,
-    required Map<String, double> appUsage,
-    required Map<String, int> appUnlocks,
-    required Map<String, double> appLongestSessions,
-  }) async {
+  /// Bulk insert apps into catalog (for initial sync)
+  Future<void> bulkInsertAppsCatalog(List<Map<String, dynamic>> apps) async {
     final db = await instance.database;
+    final batch = db.batch();
 
-    // Restrict to selected apps ONLY
-    await SelectedAppsManager.loadFromPrefs();
-    final selectedPkgs = SelectedAppsManager.selectedApps
-        .map((a) => (a['package'] ?? '').toString())
-        .where((p) => p.isNotEmpty)
-        .toSet();
-
-    // Delete old entries for this date
-    await db.delete('app_details', where: 'date = ?', whereArgs: [date]);
-
-    int saved = 0;
-    for (var pkg in appUsage.keys) {
-      if (!selectedPkgs.contains(pkg)) continue; // skip non-selected apps
-      await db.insert(
-        'app_details',
-        {
-          'date': date,
-          'package_name': pkg,
-          'usage_seconds': appUsage[pkg] ?? 0.0,
-          'unlock_count': appUnlocks[pkg] ?? 0,
-          'longest_session_seconds': appLongestSessions[pkg] ?? 0.0,
-        },
+    for (var app in apps) {
+      batch.insert(
+        'apps_catalog',
+        app,
         conflictAlgorithm: ConflictAlgorithm.replace,
       );
-      saved++;
     }
 
-    print("💾 Saved ${saved} selected apps to database (non-selected apps ignored)");
+    await batch.commit(noResult: true);
   }
 
-  /// ✅ Get today's summary stats
-  Future<Map<String, dynamic>?> getTodayStats() async {
+  /// Get category for a specific package
+  Future<String?> getAppCategory(String packageName) async {
     final db = await instance.database;
-    final today = DateTime.now().toIso8601String().substring(0, 10);
-    
     final result = await db.query(
-      'usage_stats',
-      where: 'date = ?',
-      whereArgs: [today],
+      'apps_catalog',
+      columns: ['category'],
+      where: 'package_name = ?',
+      whereArgs: [packageName],
+      limit: 1,
     );
-    
-    return result.isNotEmpty ? result.first : null;
+
+    return result.isNotEmpty ? result.first['category'] as String? : null;
   }
 
-  /// ✅ Get today's detailed app breakdown
-  Future<List<Map<String, dynamic>>> getTodayAppDetails() async {
+  /// Get all apps in catalog
+  Future<List<Map<String, dynamic>>> getAllAppsCatalog() async {
     final db = await instance.database;
-    final today = DateTime.now().toIso8601String().substring(0, 10);
-
-    await SelectedAppsManager.loadFromPrefs();
-    final pkgs = SelectedAppsManager.selectedApps
-        .map((a) => (a['package'] ?? '').toString())
-        .where((p) => p.isNotEmpty)
-        .toList();
-    if (pkgs.isEmpty) return [];
-
-    final placeholders = List.filled(pkgs.length, '?').join(',');
-    final sql = '''
-      SELECT * FROM app_details
-      WHERE date = ? AND package_name IN ($placeholders)
-      ORDER BY usage_seconds DESC
-    ''';
-    return await db.rawQuery(sql, [today, ...pkgs]);
+    return await db.query('apps_catalog', orderBy: 'app_name ASC');
   }
 
-  /// ✅ Get specific app's usage for a date
-  Future<Map<String, dynamic>?> getAppUsageForDate(
-    String packageName, 
-    String date
-  ) async {
-    final db = await instance.database;
-    
-    final result = await db.query(
-      'app_details',
-      where: 'date = ? AND package_name = ?',
-      whereArgs: [date, packageName],
-    );
-    
-    return result.isNotEmpty ? result.first : null;
-  }
-
-  /// ✅ Get last N days of summary stats
-  Future<List<Map<String, dynamic>>> getRecentStats(int days) async {
+  /// Get monitored apps only
+  Future<List<Map<String, dynamic>>> getMonitoredApps() async {
     final db = await instance.database;
     return await db.query(
-      'usage_stats',
-      orderBy: 'date DESC',
-      limit: days,
+      'apps_catalog',
+      where: 'is_monitored = 1',
+      orderBy: 'app_name ASC',
     );
   }
 
-  /// ✅ Get all-time stats
-  Future<List<Map<String, dynamic>>> getAllUsageStats() async {
+  // ============ LOCK HISTORY METHODS ============
+
+  /// Insert lock history entry
+  Future<int> insertLockHistory(Map<String, dynamic> lock) async {
     final db = await instance.database;
-    return await db.query('usage_stats', orderBy: 'date DESC');
+    return await db.insert('lock_history', lock);
   }
 
-  /// ✅ Get this week's summary stats
-  Future<List<Map<String, dynamic>>> getWeekStats() async {
-    final db = await instance.database;
-    final today = DateTime.now();
-    final weekAgo = today.subtract(const Duration(days: 7));
-    final weekAgoStr = weekAgo.toIso8601String().substring(0, 10);
-    
-    return await db.query(
-      'usage_stats',
-      where: 'date >= ?',
-      whereArgs: [weekAgoStr],
-      orderBy: 'date ASC',
-    );
-  }
-
-  /// ✅ Get week's detailed app usage
-  Future<Map<String, Map<String, double>>> getWeekAppDetails() async {
-    final db = await instance.database;
-    final today = DateTime.now();
-    final weekAgo = today.subtract(const Duration(days: 7));
-    final weekAgoStr = weekAgo.toIso8601String().substring(0, 10);
-    
-    final results = await db.query(
-      'app_details',
-      where: 'date >= ?',
-      whereArgs: [weekAgoStr],
-      orderBy: 'date ASC',
-    );
-
-    // Group by app
-    Map<String, Map<String, double>> weekData = {};
-    for (var row in results) {
-      String pkg = row['package_name'] as String;
-      String date = row['date'] as String;
-      double usage = (row['usage_seconds'] as num).toDouble() / 60; // Convert to minutes
-
-      weekData[pkg] ??= {};
-      weekData[pkg]![date] = usage;
-    }
-
-    return weekData;
-  }
-
-  /// ✅ Get top apps for a date range
-  Future<List<Map<String, dynamic>>> getTopApps({
-    required String startDate,
-    required String endDate,
-    int limit = 10,
+  /// Get lock history for a date range
+  Future<List<Map<String, dynamic>>> getLockHistory({
+    DateTime? startDate,
+    DateTime? endDate,
   }) async {
     final db = await instance.database;
 
-    await SelectedAppsManager.loadFromPrefs();
-    final pkgs = SelectedAppsManager.selectedApps
-        .map((a) => (a['package'] ?? '').toString())
-        .where((p) => p.isNotEmpty)
-        .toList();
-    if (pkgs.isEmpty) return [];
+    String? whereClause;
+    List<dynamic>? whereArgs;
 
-    final placeholders = List.filled(pkgs.length, '?').join(',');
-    final sql = '''
-      SELECT 
-        package_name as app_package,
-        SUM(usage_seconds) as total_usage_seconds,
-        SUM(unlock_count) as total_unlocks,
-        MAX(longest_session_seconds) as max_session
-      FROM app_details
-      WHERE date >= ? AND date <= ? AND package_name IN ($placeholders)
-      GROUP BY package_name
-      ORDER BY total_usage_seconds DESC
-      LIMIT ?
-    ''';
+    if (startDate != null && endDate != null) {
+      whereClause = 'timestamp >= ? AND timestamp <= ?';
+      whereArgs = [
+        startDate.millisecondsSinceEpoch,
+        endDate.millisecondsSinceEpoch,
+      ];
+    }
 
-    final results = await db.rawQuery(sql, [startDate, endDate, ...pkgs, limit]);
-    return results;
+    return await db.query(
+      'lock_history',
+      where: whereClause,
+      whereArgs: whereArgs,
+      orderBy: 'timestamp DESC',
+    );
   }
 
-  /// ✅ Get top apps by unlock count for a date range
-  Future<List<Map<String, dynamic>>> getTopAppsByUnlocks({
-    required String startDate,
-    required String endDate,
-    int limit = 10,
+  /// Get today's total locks
+  Future<int> getTodayLockCount() async {
+    final db = await instance.database;
+    final today = DateTime.now();
+    final startOfDay = DateTime(today.year, today.month, today.day);
+    final startTimestamp = startOfDay.millisecondsSinceEpoch;
+
+    final result = await db.rawQuery(
+      'SELECT COUNT(*) as count FROM lock_history WHERE timestamp >= ?',
+      [startTimestamp],
+    );
+    return (result.first['count'] as int?) ?? 0;
+  }
+
+  /// Get violation-free streak (consecutive days without lock events)
+  Future<int> getViolationFreeStreak() async {
+    final db = await instance.database;
+
+    try {
+      final lockResult = await db.rawQuery('''
+        SELECT MAX(timestamp) as last_lock
+        FROM lock_history
+      ''');
+
+      if (lockResult.isEmpty || lockResult.first['last_lock'] == null) {
+        // No locks ever - return high streak
+        return 30; // Default streak if no violations
+      }
+
+      final lastLockTimestamp = lockResult.first['last_lock'] as int;
+      final lastLock = DateTime.fromMillisecondsSinceEpoch(lastLockTimestamp);
+      final daysSinceLock = DateTime.now().difference(lastLock).inDays;
+
+      return daysSinceLock;
+    } catch (e) {
+      print('Error getting violation-free streak: $e');
+      return 0;
+    }
+  }
+
+  // ============ DECISION TREE DATA METHODS ============
+
+  /// Insert decision tree training data
+  Future<int> insertDecisionTreeData(Map<String, dynamic> data) async {
+    final db = await instance.database;
+    return await db.insert('decision_tree_data', data);
+  }
+
+  /// Get decision tree training data
+  Future<List<Map<String, dynamic>>> getDecisionTreeData({
+    DateTime? startDate,
+    DateTime? endDate,
+    int? limit,
   }) async {
     final db = await instance.database;
 
-    await SelectedAppsManager.loadFromPrefs();
-    final pkgs = SelectedAppsManager.selectedApps
-        .map((a) => (a['package'] ?? '').toString())
-        .where((p) => p.isNotEmpty)
-        .toList();
-    if (pkgs.isEmpty) return [];
+    String? whereClause;
+    List<dynamic>? whereArgs;
 
-    final placeholders = List.filled(pkgs.length, '?').join(',');
-    final sql = '''
-      SELECT 
-        package_name as app_package,
-        SUM(usage_seconds) as total_usage_seconds,
-        SUM(unlock_count) as total_unlocks,
-        MAX(longest_session_seconds) as max_session
-      FROM app_details
-      WHERE date >= ? AND date <= ? AND package_name IN ($placeholders)
-      GROUP BY package_name
-      ORDER BY total_unlocks DESC
-      LIMIT ?
-    ''';
-
-    final results = await db.rawQuery(sql, [startDate, endDate, ...pkgs, limit]);
-    return results;
-  }
-
-  /// ✅ Get total usage for today
-  Future<double> getTodayTotalUsage() async {
-    final stats = await getTodayStats();
-    if (stats == null) return 0.0;
-    return (stats['daily_usage_hours'] as num? ?? 0.0).toDouble();
-  }
-
-  /// ✅ Get total usage for this week
-  Future<double> getWeekTotalUsage() async {
-    final weekStats = await getWeekStats();
-    double total = 0.0;
-    for (var stat in weekStats) {
-      total += (stat['daily_usage_hours'] as num? ?? 0.0).toDouble();
-    }
-    return total;
-  }
-
-  /// ✅ Get last week's total usage for comparison
-  Future<double> getLastWeekTotalUsage() async {
-    final db = await instance.database;
-    final today = DateTime.now();
-    final lastWeekStart = today.subtract(const Duration(days: 14));
-    final lastWeekEnd = today.subtract(const Duration(days: 8));
-    final startStr = lastWeekStart.toIso8601String().substring(0, 10);
-    final endStr = lastWeekEnd.toIso8601String().substring(0, 10);
-    
-    final results = await db.query(
-      'usage_stats',
-      where: 'date >= ? AND date <= ?',
-      whereArgs: [startStr, endStr],
-    );
-    
-    double total = 0.0;
-    for (var stat in results) {
-      total += (stat['daily_usage_hours'] as num? ?? 0.0).toDouble();
-    }
-    return total;
-  }
-
-  /// ✅ Check if new day
-  Future<bool> isNewDay() async {
-    final today = DateTime.now().toIso8601String().substring(0, 10);
-    final stats = await getAllUsageStats();
-    
-    if (stats.isEmpty) return true;
-    
-    final lastDate = stats.first['date'];
-    return lastDate != today;
-  }
-
-  /// ✅ Clean old data
-  Future<void> cleanOldStats(int keepDays) async {
-    final db = await instance.database;
-    final cutoffDate = DateTime.now()
-        .subtract(Duration(days: keepDays))
-        .toIso8601String()
-        .substring(0, 10);
-    
-    await db.delete(
-      'usage_stats',
-      where: 'date < ?',
-      whereArgs: [cutoffDate],
-    );
-
-    await db.delete(
-      'app_details',
-      where: 'date < ?',
-      whereArgs: [cutoffDate],
-    );
-    
-    print("🗑️ Cleaned data older than $cutoffDate");
-  }
-
-  /// ✅ Get analytics summary
-  Future<Map<String, dynamic>> getAnalyticsSummary(String date) async {
-    final db = await instance.database;
-    
-    // Get daily summary
-    final dailyStats = await db.query(
-      'usage_stats',
-      where: 'date = ?',
-      whereArgs: [date],
-    );
-
-    // Get app breakdown
-    await SelectedAppsManager.loadFromPrefs();
-    final pkgs = SelectedAppsManager.selectedApps
-        .map((a) => (a['package'] ?? '').toString())
-        .where((p) => p.isNotEmpty)
-        .toList();
-
-    List<Map<String, dynamic>> appDetails = [];
-    if (pkgs.isNotEmpty) {
-      final placeholders = List.filled(pkgs.length, '?').join(',');
-      final sql = '''
-        SELECT * FROM app_details
-        WHERE date = ? AND package_name IN ($placeholders)
-        ORDER BY usage_seconds DESC
-      ''';
-      appDetails = await db.rawQuery(sql, [date, ...pkgs]);
+    if (startDate != null && endDate != null) {
+      whereClause = 'timestamp >= ? AND timestamp <= ?';
+      whereArgs = [
+        startDate.millisecondsSinceEpoch,
+        endDate.millisecondsSinceEpoch,
+      ];
     }
 
-    // Calculate totals
-    double totalAllAppsSeconds = appDetails.fold(
-      0.0, 
-      (sum, app) => sum + ((app['usage_seconds'] as num?)?.toDouble() ?? 0)
+    return await db.query(
+      'decision_tree_data',
+      where: whereClause,
+      whereArgs: whereArgs,
+      orderBy: 'timestamp ASC',
+      limit: limit,
     );
-
-    int totalUnlocks = appDetails.fold(
-      0, 
-      (sum, app) => sum + ((app['unlock_count'] as int?) ?? 0)
-    );
-
-    return {
-      'date': date,
-      'summary': dailyStats.isNotEmpty ? dailyStats.first : null,
-      'total_apps_used': appDetails.length,
-      'total_all_apps_hours': totalAllAppsSeconds / 3600,
-      'total_unlocks': totalUnlocks,
-      'app_breakdown': appDetails.take(10).toList(),
-    };
   }
 
-  // ---------------- EMERGENCY UNLOCK METHODS ----------------
-  
+  /// Get total training data count
+  Future<int> getDecisionTreeDataCount() async {
+    final db = await instance.database;
+    final result = await db.rawQuery('SELECT COUNT(*) as count FROM decision_tree_data');
+    return (result.first['count'] as int?) ?? 0;
+  }
+
+  // ============ EMERGENCY UNLOCK METHODS ============
+
   /// Log an emergency unlock attempt
   Future<int> logEmergencyUnlock({
     required String method,
@@ -676,7 +530,7 @@ class DatabaseHelper {
     final db = await instance.database;
     final now = DateTime.now().millisecondsSinceEpoch;
     final dayAgo = now - (24 * 60 * 60 * 1000);
-    
+
     final result = await db.rawQuery(
       'SELECT COUNT(*) as count FROM emergency_unlocks WHERE timestamp >= ?',
       [dayAgo],
@@ -684,7 +538,7 @@ class DatabaseHelper {
     return (result.first['count'] as int?) ?? 0;
   }
 
-  /// Get all emergency unlocks (for admin/viewing)
+  /// Get all emergency unlocks
   Future<List<Map<String, dynamic>>> getAllEmergencyUnlocks() async {
     final db = await instance.database;
     return await db.query(
@@ -693,366 +547,589 @@ class DatabaseHelper {
     );
   }
 
-  /// Get emergency unlocks with abuse penalties
-  Future<List<Map<String, dynamic>>> getAbuseEmergencyUnlocks() async {
+  // ============ SESSION LOGGING METHODS ============
+
+  /// Log session start
+  Future<int> logSessionStart() async {
     final db = await instance.database;
-    return await db.query(
-      'emergency_unlocks',
-      where: 'abuse_penalty_applied = ?',
-      whereArgs: [1],
-      orderBy: 'timestamp DESC',
+    return await db.insert('session_logs', {
+      'package_name': 'unknown',
+      'category': 'unknown',
+      'start_time': DateTime.now().millisecondsSinceEpoch,
+    });
+  }
+
+  /// Log session end
+  Future<void> logSessionEnd({
+    required int sessionStart,
+    String? reason,
+    List<String>? appsUsed,
+  }) async {
+    final db = await instance.database;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final duration = ((now - sessionStart) / 1000).round();
+
+    await db.insert('session_logs', {
+      'package_name': appsUsed?.join(',') ?? 'unknown',
+      'category': reason ?? 'unknown',
+      'start_time': sessionStart,
+      'end_time': now,
+      'duration_seconds': duration,
+      'was_locked': 0,
+    });
+  }
+
+  // ============ USAGE STATS METHODS ============
+
+  /// Save daily usage stats (accepts Map for compatibility)
+  Future<void> saveUsageStats(Map<String, dynamic> stats) async {
+    final db = await instance.database;
+
+    // Extract data from map
+    final today = DateTime.now().toIso8601String().substring(0, 10);
+
+    // Save aggregate stats (simplified)
+    await db.insert(
+      'usage_stats',
+      {
+        'date': today,
+        'category': 'all',
+        'total_usage_seconds': ((stats['daily_usage_hours'] as num? ?? 0) * 3600).round(),
+        'session_count': 1,
+      },
+      conflictAlgorithm: ConflictAlgorithm.replace,
     );
   }
 
-  // ---------------- VIOLATION LOGGING METHODS ----------------
-  
-  /// Log a violation event
-  Future<int> logViolation({
-    required String violationType,
-    required String appName,
+  /// Save detailed app usage
+  Future<void> saveDetailedAppUsage({
+    required String date,
+    required Map<String, double> appUsage,
+    required Map<String, int> appUnlocks,
+    required Map<String, double> appLongestSessions,
+  }) async {
+    final db = await instance.database;
+    final batch = db.batch();
+
+    // ✅ CRITICAL FIX: Get categories for all packages, ensuring proper categorization
+    // This ensures messaging apps, system apps, and uncategorized apps go to "Others"
+    final categoryMap = await _getCategoriesForPackages(appUsage.keys.toSet());
+
+    for (var entry in appUsage.entries) {
+      final packageName = entry.key;
+      final usageSeconds = entry.value.round();
+      final unlockCount = appUnlocks[packageName] ?? 0;
+      
+      // ✅ CRITICAL FIX: Ensure proper categorization
+      // If app is not in catalog, try to get category from AppCategorizationService
+      String category = categoryMap[packageName] ?? CategoryMapper.categoryOthers;
+      
+      // ✅ If category is "Others" or not found, verify it's actually "Others"
+      // This ensures messaging apps, system apps, and uncategorized apps are properly tracked
+      if (category == CategoryMapper.categoryOthers || !categoryMap.containsKey(packageName)) {
+        try {
+          // Try to get category from AppCategorizationService (handles messaging apps, system apps)
+          final verifiedCategory = await AppCategorizationService.getCategoryForPackage(packageName);
+          category = verifiedCategory;
+          print("   ✅ Categorized $packageName as $category (was missing from catalog)");
+        } catch (e) {
+          // If categorization fails, default to "Others"
+          category = CategoryMapper.categoryOthers;
+          print("   ⚠️ Failed to categorize $packageName, defaulting to Others: $e");
+        }
+      }
+
+      batch.insert(
+        'app_details',
+        {
+          'date': date,
+          'package_name': packageName,
+          'app_name': packageName.split('.').last,
+          'category': category,
+          'usage_seconds': usageSeconds,
+          'unlock_count': unlockCount,
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+    }
+
+    await batch.commit(noResult: true);
+    print("✅ Saved ${appUsage.length} apps to database with proper categorization");
+  }
+
+  Future<Map<String, String>> _getCategoriesForPackages(
+    Set<String> packages,
+  ) async {
+    final Map<String, String> categoryMap = {};
+    if (packages.isEmpty) return categoryMap;
+
+    final db = await instance.database;
+    final placeholders = List.filled(packages.length, '?').join(',');
+    final packageList = packages.toList();
+
+    final rows = await db.rawQuery(
+      'SELECT package_name, category FROM apps_catalog '
+      'WHERE package_name IN ($placeholders)',
+      packageList,
+    );
+
+    for (final row in rows) {
+      final packageName = row['package_name'] as String?;
+      final category = row['category'] as String?;
+      if (packageName != null && category != null) {
+        categoryMap[packageName] = category;
+      }
+    }
+
+    // Fallback for packages not found in catalog
+    for (final package in packages) {
+      if (categoryMap.containsKey(package)) continue;
+      final fallback = CategoryMapper.mapPackageToCategory(package) ??
+          CategoryMapper.categoryOthers;
+      categoryMap[package] = fallback;
+    }
+
+    return categoryMap;
+  }
+
+  /// Get total usage minutes per category for a specific date
+  Future<Map<String, double>> getCategoryUsageForDate(DateTime date) async {
+    final db = await instance.database;
+    final dateKey = _dateKey(date);
+    
+    // Get all app details for the date
+    final allApps = await db.query(
+      'app_details',
+      where: 'date = ?',
+      whereArgs: [dateKey],
+    );
+
+    final usage = <String, double>{
+      CategoryMapper.categorySocial: 0.0,
+      CategoryMapper.categoryGames: 0.0,
+      CategoryMapper.categoryEntertainment: 0.0,
+      CategoryMapper.categoryOthers: 0.0,
+    };
+
+    // Group by category, including messaging apps in "Others" category
+    for (final row in allApps) {
+      final category = row['category'] as String? ?? CategoryMapper.categoryOthers;
+      final seconds = (row['usage_seconds'] as num?)?.toDouble() ?? 0.0;
+      
+      // ✅ Messaging apps are now included in "Others" category usage
+      // They are tracked and shown in the dashboard
+      
+      usage[category] = (usage[category] ?? 0.0) + (seconds / 60.0);
+    }
+
+    return usage;
+  }
+
+  /// Get top 3 most unlocked apps for the week
+  Future<List<Map<String, dynamic>>> getTopUnlockedAppsWeek() async {
+    final db = await instance.database;
+    final today = DateTime.now();
+    final weekAgo = today.subtract(const Duration(days: 7));
+    
+    final result = await db.rawQuery('''
+      SELECT 
+        package_name,
+        SUM(unlock_count) as total_unlocks
+      FROM app_details
+      WHERE date >= ? AND date <= ?
+      GROUP BY package_name
+      HAVING total_unlocks > 0
+      ORDER BY total_unlocks DESC
+      LIMIT 3
+    ''', [_dateKey(weekAgo), _dateKey(today)]);
+    
+    return result;
+  }
+
+  /// Get top 3 longest used apps for today
+  Future<List<Map<String, dynamic>>> getTopLongestUsedAppsToday() async {
+    final db = await instance.database;
+    final today = DateTime.now();
+    
+    final result = await db.rawQuery('''
+      SELECT 
+        package_name,
+        usage_seconds
+      FROM app_details
+      WHERE date = ?
+      ORDER BY usage_seconds DESC
+      LIMIT 3
+    ''', [_dateKey(today)]);
+    
+    return result;
+  }
+
+  /// Get top 3 longest used apps for the week
+  Future<List<Map<String, dynamic>>> getTopLongestUsedAppsWeek() async {
+    final db = await instance.database;
+    final today = DateTime.now();
+    final weekAgo = today.subtract(const Duration(days: 7));
+    
+    final result = await db.rawQuery('''
+      SELECT 
+        package_name,
+        SUM(usage_seconds) as total_seconds
+      FROM app_details
+      WHERE date >= ? AND date <= ?
+      GROUP BY package_name
+      HAVING total_seconds > 0
+      ORDER BY total_seconds DESC
+      LIMIT 3
+    ''', [_dateKey(weekAgo), _dateKey(today)]);
+    
+    return result;
+  }
+
+  /// Get total usage minutes for each date starting from [startDate]
+  Future<Map<String, double>> getUsageTotalsSince(DateTime startDate) async {
+    final db = await instance.database;
+    final startKey = _dateKey(startDate);
+
+    final result = await db.rawQuery(
+      '''
+      SELECT date, SUM(usage_seconds) AS total_seconds
+      FROM app_details
+      WHERE date >= ?
+      GROUP BY date
+      ORDER BY date ASC
+      ''',
+      [startKey],
+    );
+
+    final totals = <String, double>{};
+    for (final row in result) {
+      final date = row['date'] as String? ?? '';
+      final seconds = (row['total_seconds'] as num?)?.toDouble() ?? 0.0;
+      totals[date] = seconds / 60.0;
+    }
+
+    return totals;
+  }
+
+  /// Get top apps by unlock count
+  Future<List<Map<String, dynamic>>> getTopApps({
+    String? startDate,
+    String? endDate,
+    int limit = 10,
+  }) async {
+    final db = await instance.database;
+
+    String? whereClause;
+    List<dynamic>? whereArgs;
+
+    if (startDate != null && endDate != null) {
+      whereClause = 'date >= ? AND date <= ?';
+      whereArgs = [startDate, endDate];
+    } else if (startDate != null) {
+      whereClause = 'date = ?';
+      whereArgs = [startDate];
+    }
+
+    return await db.query(
+      'app_details',
+      where: whereClause,
+      whereArgs: whereArgs,
+      orderBy: 'unlock_count DESC',
+      limit: limit,
+    );
+  }
+
+  /// Get weekly most unlocked apps (aggregated by package name)
+  Future<List<Map<String, dynamic>>> getWeeklyMostUnlockedApps({
+    int limit = 3,
+  }) async {
+    final db = await instance.database;
+    final now = DateTime.now();
+    final weekStart = now.subtract(Duration(days: now.weekday - 1));
+    final weekStartKey = _dateKey(weekStart);
+    final weekEndKey = _dateKey(now);
+
+    final result = await db.rawQuery('''
+      SELECT 
+        package_name,
+        app_name,
+        SUM(unlock_count) as total_unlocks,
+        MAX(app_name) as display_name
+      FROM app_details
+      WHERE date >= ? AND date <= ?
+      AND unlock_count > 0
+      GROUP BY package_name
+      ORDER BY total_unlocks DESC
+      LIMIT ?
+    ''', [weekStartKey, weekEndKey, limit]);
+
+    return result.map((row) => {
+      'packageName': row['package_name'] as String,
+      'appName': row['display_name'] as String? ?? row['package_name'] as String,
+      'unlockCount': (row['total_unlocks'] as num?)?.toInt() ?? 0,
+    }).toList();
+  }
+
+  /// Get top longest used apps for today (by usage_seconds)
+  Future<List<Map<String, dynamic>>> getTodayLongestUsedApps({
+    int limit = 3,
+  }) async {
+    final db = await instance.database;
+    final todayKey = _dateKey(DateTime.now());
+
+    final result = await db.rawQuery('''
+      SELECT 
+        package_name,
+        app_name,
+        usage_seconds
+      FROM app_details
+      WHERE date = ?
+      AND usage_seconds > 0
+      ORDER BY usage_seconds DESC
+      LIMIT ?
+    ''', [todayKey, limit]);
+
+    return result.map((row) => {
+      'packageName': row['package_name'] as String,
+      'appName': row['app_name'] as String? ?? row['package_name'] as String,
+      'usageMinutes': ((row['usage_seconds'] as num?)?.toDouble() ?? 0.0) / 60.0,
+    }).toList();
+  }
+
+  /// Get top longest used apps for the week (aggregated by package name)
+  Future<List<Map<String, dynamic>>> getWeeklyLongestUsedApps({
+    int limit = 3,
+  }) async {
+    final db = await instance.database;
+    final now = DateTime.now();
+    final weekStart = now.subtract(Duration(days: now.weekday - 1));
+    final weekStartKey = _dateKey(weekStart);
+    final weekEndKey = _dateKey(now);
+
+    final result = await db.rawQuery('''
+      SELECT 
+        package_name,
+        app_name,
+        SUM(usage_seconds) as total_usage_seconds,
+        MAX(app_name) as display_name
+      FROM app_details
+      WHERE date >= ? AND date <= ?
+      AND usage_seconds > 0
+      GROUP BY package_name
+      ORDER BY total_usage_seconds DESC
+      LIMIT ?
+    ''', [weekStartKey, weekEndKey, limit]);
+
+    return result.map((row) => {
+      'packageName': row['package_name'] as String,
+      'appName': row['display_name'] as String? ?? row['package_name'] as String,
+      'usageMinutes': ((row['total_usage_seconds'] as num?)?.toDouble() ?? 0.0) / 60.0,
+    }).toList();
+  }
+
+  /// Get peak usage hours (returns String for compatibility)
+  Future<String> getPeakUsageHours() async {
+    final db = await instance.database;
+
+    try {
+      final sessions = await db.query(
+        'session_logs',
+        where: 'end_time IS NOT NULL',
+        orderBy: 'start_time DESC',
+        limit: 100,
+      );
+
+      if (sessions.isEmpty) {
+        return 'Not enough data';
+      }
+
+      // Group by hour
+      Map<int, int> hourlyUsage = {};
+
+      for (var session in sessions) {
+        final startTime = session['start_time'] as int;
+        final hour = DateTime.fromMillisecondsSinceEpoch(startTime).hour;
+        final duration = (session['duration_seconds'] as int?) ?? 0;
+
+        hourlyUsage[hour] = (hourlyUsage[hour] ?? 0) + duration;
+      }
+
+      // Find top 3 peak hours
+      var sortedHours = hourlyUsage.entries.toList()
+        ..sort((a, b) => b.value.compareTo(a.value));
+
+      if (sortedHours.isEmpty) {
+        return 'Not enough data';
+      }
+
+      // Format as readable string
+      final topHours = sortedHours.take(3).map((e) {
+        final hour = e.key;
+        final period = hour >= 12 ? 'PM' : 'AM';
+        final displayHour = hour > 12 ? hour - 12 : (hour == 0 ? 12 : hour);
+        return '$displayHour$period';
+      }).join(', ');
+
+      return topHours;
+    } catch (e) {
+      print('Error getting peak usage hours: $e');
+      return 'Not enough data';
+    }
+  }
+
+  /// Log violation (compatibility method)
+  Future<void> logViolation({
+    String? violationType,
+    String? appName,
     String? appPackage,
     double? dailyHours,
     double? sessionMinutes,
     int? unlockCount,
     int? cooldownSeconds,
   }) async {
-    final db = await instance.database;
-    return await db.insert(
-      'violation_logs',
-      {
-        'timestamp': DateTime.now().millisecondsSinceEpoch,
-        'violation_type': violationType,
-        'app_name': appName,
-        'app_package': appPackage,
-        'daily_hours': dailyHours,
-        'session_minutes': sessionMinutes,
-        'unlock_count': unlockCount,
-        'cooldown_seconds': cooldownSeconds,
-      },
-    );
+    final category = appName ?? appPackage ?? 'unknown';
+    final reason = violationType ?? 'limit_exceeded';
+    final lockDuration = cooldownSeconds ?? (sessionMinutes != null ? (sessionMinutes * 60).round() : 0);
+
+    await insertLockHistory({
+      'timestamp': DateTime.now().millisecondsSinceEpoch,
+      'category': category,
+      'lock_duration_seconds': lockDuration,
+      'reason': reason,
+      'violation_type': violationType,
+    });
   }
 
-  /// Get all violations for a date range
-  Future<List<Map<String, dynamic>>> getViolations({
-    String? startDate,
-    String? endDate,
-  }) async {
-    final db = await instance.database;
-    
-    if (startDate != null && endDate != null) {
-      // Convert date strings to timestamps
-      final startTimestamp = DateTime.parse('${startDate}T00:00:00').millisecondsSinceEpoch;
-      final endTimestamp = DateTime.parse('${endDate}T23:59:59').millisecondsSinceEpoch;
-      
-      return await db.query(
-        'violation_logs',
-        where: 'timestamp >= ? AND timestamp <= ?',
-        whereArgs: [startTimestamp, endTimestamp],
-        orderBy: 'timestamp DESC',
-      );
-    }
-    
-    return await db.query(
-      'violation_logs',
-      orderBy: 'timestamp DESC',
-    );
-  }
+  // ============ UTILITY METHODS ============
 
-  /// Get today's violations
-  Future<List<Map<String, dynamic>>> getTodayViolations() async {
-    final today = DateTime.now();
-    final startOfDay = DateTime(today.year, today.month, today.day);
-    final endOfDay = startOfDay.add(const Duration(days: 1)).subtract(const Duration(seconds: 1));
-    
-    return await getViolations(
-      startDate: startOfDay.toIso8601String().substring(0, 10),
-      endDate: endOfDay.toIso8601String().substring(0, 10),
-    );
-  }
-
-  /// Get violations by type
-  Future<List<Map<String, dynamic>>> getViolationsByType(String violationType) async {
+  /// Clean old data (keep last 90 days)
+  Future<void> cleanOldData() async {
     final db = await instance.database;
-    return await db.query(
-      'violation_logs',
-      where: 'violation_type = ?',
-      whereArgs: [violationType],
-      orderBy: 'timestamp DESC',
-    );
-  }
+    final cutoffDate = DateTime.now().subtract(const Duration(days: 90));
+    final cutoffTimestamp = cutoffDate.millisecondsSinceEpoch;
+    final cutoffDateStr = '${cutoffDate.year}-${cutoffDate.month.toString().padLeft(2, '0')}-${cutoffDate.day.toString().padLeft(2, '0')}';
 
-  // ---------------- SESSION LOGGING METHODS ----------------
-  
-  /// Log a session start (when new session begins)
-  Future<int> logSessionStart() async {
-    final db = await instance.database;
-    final now = DateTime.now().millisecondsSinceEpoch;
-    return await db.insert(
+    // Clean old lock history
+    await db.delete(
+      'lock_history',
+      where: 'timestamp < ?',
+      whereArgs: [cutoffTimestamp],
+    );
+
+    // Clean old emergency unlocks
+    await db.delete(
+      'emergency_unlocks',
+      where: 'timestamp < ?',
+      whereArgs: [cutoffTimestamp],
+    );
+
+    // Clean old session logs
+    await db.delete(
       'session_logs',
-      {
-        'session_start': now,
-        'session_end': null,
-        'duration_minutes': null,
-        'ended_reason': null,
-        'apps_used': null,
-      },
-    );
-  }
-
-  /// Log a session end (when session ends due to inactivity or violation)
-  Future<void> logSessionEnd({
-    required int sessionStart,
-    required String reason, // 'inactivity', 'violation', 'cooldown', 'midnight'
-    String? appsUsed,
-  }) async {
-    final db = await instance.database;
-    final now = DateTime.now().millisecondsSinceEpoch;
-    final durationMinutes = (now - sessionStart) / 1000 / 60;
-
-    // Find the session log entry with this start time and no end time
-    final existingSessions = await db.query(
-      'session_logs',
-      where: 'session_start = ? AND session_end IS NULL',
-      whereArgs: [sessionStart],
-      limit: 1,
+      where: 'start_time < ?',
+      whereArgs: [cutoffTimestamp],
     );
 
-    if (existingSessions.isNotEmpty) {
-      // Update existing session
-      await db.update(
-        'session_logs',
-        {
-          'session_end': now,
-          'duration_minutes': durationMinutes,
-          'ended_reason': reason,
-          'apps_used': appsUsed,
-        },
-        where: 'session_start = ?',
-        whereArgs: [sessionStart],
-      );
-    } else {
-      // Create new entry if somehow missing
-      await db.insert(
-        'session_logs',
-        {
-          'session_start': sessionStart,
-          'session_end': now,
-          'duration_minutes': durationMinutes,
-          'ended_reason': reason,
-          'apps_used': appsUsed,
-        },
-      );
-    }
-  }
-
-  /// Get all session logs
-  Future<List<Map<String, dynamic>>> getAllSessionLogs() async {
-    final db = await instance.database;
-    return await db.query(
-      'session_logs',
-      orderBy: 'session_start DESC',
+    // Clean old usage stats
+    await db.delete(
+      'usage_stats',
+      where: 'date < ?',
+      whereArgs: [cutoffDateStr],
     );
-  }
 
-  /// Get hourly usage breakdown for today (for daily graph)
-  /// Returns a map where key = hour (0-23), value = map of app_package -> minutes
-  Future<Map<int, Map<String, double>>> getTodayHourlyUsageByApp() async {
-    final db = await instance.database;
-    final today = DateTime.now().toIso8601String().substring(0, 10);
-    
-    // Get all app details for today
-    final apps = await db.query(
+    // Clean old app details
+    await db.delete(
       'app_details',
-      where: 'date = ?',
-      whereArgs: [today],
+      where: 'date < ?',
+      whereArgs: [cutoffDateStr],
     );
-    
-    // Initialize hourly data structure
-    Map<int, Map<String, double>> hourlyUsage = {};
-    for (int i = 0; i < 24; i++) {
-      hourlyUsage[i] = {};
+
+    // Keep only last 50 training history entries
+    final historyCountResult = await db.rawQuery('SELECT COUNT(*) as count FROM ml_training_history');
+    final historyCount = (historyCountResult.first['count'] as int?) ?? 0;
+
+    if (historyCount > 50) {
+      // Delete oldest entries, keeping newest 50
+      await db.rawQuery('''
+        DELETE FROM ml_training_history
+        WHERE id NOT IN (
+          SELECT id FROM ml_training_history
+          ORDER BY timestamp DESC
+          LIMIT 50
+        )
+      ''');
     }
-    
-    final currentHour = DateTime.now().hour;
-    
-    if (apps.isNotEmpty) {
-      // Distribute each app's usage across active hours
-      final startHour = 6; // Assume usage starts at 6 AM
-      final activeHours = currentHour >= startHour ? (currentHour - startHour + 1) : 1;
-      
-      for (var app in apps) {
-        final packageName = app['package_name'] as String;
-        final totalMinutes = ((app['usage_seconds'] as num?) ?? 0.0) / 60.0;
-        
-        if (totalMinutes > 0) {
-          // Distribute this app's usage across hours with realistic pattern
-          for (int hour = startHour; hour <= currentHour; hour++) {
-            // Evening hours (18-23) get more weight
-            double weight = (hour >= 18) ? 1.5 : 1.0;
-            double minutesThisHour = (totalMinutes / activeHours) * weight;
-            
-            hourlyUsage[hour]![packageName] = minutesThisHour;
-          }
-          
-          // Normalize to match total for this app
-          double distributedTotal = 0.0;
-          for (int hour = startHour; hour <= currentHour; hour++) {
-            distributedTotal += hourlyUsage[hour]![packageName] ?? 0.0;
-          }
-          
-          if (distributedTotal > 0) {
-            double factor = totalMinutes / distributedTotal;
-            for (int hour = startHour; hour <= currentHour; hour++) {
-              if (hourlyUsage[hour]!.containsKey(packageName)) {
-                hourlyUsage[hour]![packageName] = hourlyUsage[hour]![packageName]! * factor;
-              }
-            }
-          }
-        }
-      }
+
+    // Keep only last 1000 decision tree training data points
+    final countResult = await db.rawQuery('SELECT COUNT(*) as count FROM decision_tree_data');
+    final count = (countResult.first['count'] as int?) ?? 0;
+
+    if (count > 1000) {
+      // Delete oldest entries, keeping newest 1000
+      await db.rawQuery('''
+        DELETE FROM decision_tree_data
+        WHERE id NOT IN (
+          SELECT id FROM decision_tree_data
+          ORDER BY timestamp DESC
+          LIMIT 1000
+        )
+      ''');
     }
-    
-    return hourlyUsage;
-  }
-  
-  /// Get total hourly usage (sum of all apps) for simple display
-  Future<Map<int, double>> getTodayHourlyUsage() async {
-    final hourlyByApp = await getTodayHourlyUsageByApp();
-    Map<int, double> totalHourly = {};
-    
-    for (var entry in hourlyByApp.entries) {
-      double total = entry.value.values.fold(0.0, (sum, val) => sum + val);
-      totalHourly[entry.key] = total;
-    }
-    
-    return totalHourly;
-  }
-  
-  /// Get daily usage for the past 7 days with per-app breakdown (for stacked bars)
-  /// Returns a list of maps with 'date', 'day_name', 'usage_hours', 'apps_usage'
-  Future<List<Map<String, dynamic>>> getWeeklyDailyUsageByApp() async {
-    final db = await instance.database;
-    final today = DateTime.now();
-    List<Map<String, dynamic>> weeklyData = [];
-    
-    for (int i = 6; i >= 0; i--) {
-      final date = today.subtract(Duration(days: i));
-      final dateStr = date.toIso8601String().substring(0, 10);
-      
-      // Get per-app usage for this day
-      final apps = await db.query(
-        'app_details',
-        where: 'date = ?',
-        whereArgs: [dateStr],
-      );
-      
-      // Build app usage map
-      Map<String, double> appsUsage = {};
-      double totalHours = 0.0;
-      
-      for (var app in apps) {
-        final packageName = app['package_name'] as String;
-        final hours = ((app['usage_seconds'] as num?) ?? 0.0) / 3600.0;
-        appsUsage[packageName] = hours;
-        totalHours += hours;
-      }
-      
-      // Get day name (S, M, T, W, T, F, S)
-      final dayNames = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
-      final dayName = dayNames[date.weekday % 7];
-      
-      weeklyData.add({
-        'date': dateStr,
-        'day_name': dayName,
-        'usage_hours': totalHours,
-        'apps_usage': appsUsage, // Map<String, double> of package -> hours
-        'is_today': i == 0,
-      });
-    }
-    
-    return weeklyData;
-  }
-  
-  /// Get daily usage for the past 7 days (total only, for simple display)
-  Future<List<Map<String, dynamic>>> getWeeklyDailyUsage() async {
-    final weeklyByApp = await getWeeklyDailyUsageByApp();
-    // Return same format but without apps_usage for backward compatibility
-    return weeklyByApp.map((day) => {
-      'date': day['date'],
-      'day_name': day['day_name'],
-      'usage_hours': day['usage_hours'],
-      'is_today': day['is_today'],
-    }).toList();
+
+    print("🗑️ Cleaned old data (kept last 90 days)");
   }
 
-  /// Save LSTM training snapshot
-  Future<int> saveLSTMTrainingSnapshot({
-    required double dailyUsageHours,
-    required int mostUnlockCount,
-    required double maxSessionMinutes,
-    required double currentSessionMinutes,
-    String? featureVector,
-    String snapshotType = 'periodic',
+  // ============ ML TRAINING HISTORY METHODS ============
+
+  /// Save training history for analytics
+  Future<int> saveTrainingHistory({
+    required int timestamp,
+    required int trainingSamples,
+    required int testSamples,
+    required double accuracy,
+    required double precision,
+    required double recall,
+    required double f1Score,
+    double? trainAccuracy,
+    bool overfittingDetected = false,
   }) async {
     final db = await instance.database;
     return await db.insert(
-      'lstm_training_snapshots',
+      'ml_training_history',
       {
-        'timestamp': DateTime.now().millisecondsSinceEpoch,
-        'daily_usage_hours': dailyUsageHours,
-        'most_unlock_count': mostUnlockCount,
-        'max_session_minutes': maxSessionMinutes,
-        'current_session_minutes': currentSessionMinutes,
-        'feature_vector': featureVector,
-        'snapshot_type': snapshotType,
+        'timestamp': timestamp,
+        'training_samples': trainingSamples,
+        'test_samples': testSamples,
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1_score': f1Score,
+        'train_accuracy': trainAccuracy,
+        'overfitting_detected': overfittingDetected ? 1 : 0,
       },
     );
   }
 
-  /// Get LSTM training snapshots for a date range
-  Future<List<Map<String, dynamic>>> getLSTMTrainingSnapshots({
-    DateTime? startDate,
-    DateTime? endDate,
-    int? limit,
-  }) async {
+  /// Get training history (most recent first)
+  Future<List<Map<String, dynamic>>> getTrainingHistory({int limit = 50}) async {
     final db = await instance.database;
-    
-    String? whereClause;
-    List<dynamic>? whereArgs;
-    
-    if (startDate != null && endDate != null) {
-      whereClause = 'timestamp >= ? AND timestamp <= ?';
-      whereArgs = [
-        startDate.millisecondsSinceEpoch,
-        endDate.millisecondsSinceEpoch,
-      ];
-    }
-    
     return await db.query(
-      'lstm_training_snapshots',
-      where: whereClause,
-      whereArgs: whereArgs,
-      orderBy: 'timestamp ASC',
+      'ml_training_history',
+      orderBy: 'timestamp DESC',
       limit: limit,
     );
   }
 
-  /// Get today's session logs
-  Future<List<Map<String, dynamic>>> getTodaySessionLogs() async {
+  /// Get latest training metrics
+  Future<Map<String, dynamic>?> getLatestTrainingMetrics() async {
     final db = await instance.database;
-    final today = DateTime.now();
-    final startOfDay = DateTime(today.year, today.month, today.day);
-    final endOfDay = startOfDay.add(const Duration(days: 1));
-    
-    final startTimestamp = startOfDay.millisecondsSinceEpoch;
-    final endTimestamp = endOfDay.millisecondsSinceEpoch;
-    
-    return await db.query(
-      'session_logs',
-      where: 'session_start >= ? AND session_start < ?',
-      whereArgs: [startTimestamp, endTimestamp],
-      orderBy: 'session_start DESC',
+    final results = await db.query(
+      'ml_training_history',
+      orderBy: 'timestamp DESC',
+      limit: 1,
     );
+    if (results.isEmpty) return null;
+    return results.first;
   }
 
   Future close() async {

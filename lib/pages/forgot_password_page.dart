@@ -201,7 +201,7 @@ class _ForgotPasswordPageState extends State<ForgotPasswordPage> {
                 pinVerified
                     ? "Enter your new password below"
                     : "Enter your 4-digit PIN to reset your password",
-                style: GoogleFonts.poppins(
+                style: GoogleFonts.alice(
                   fontSize: 14,
                   color: Colors.black54,
                 ),
@@ -359,7 +359,7 @@ class _ForgotPasswordPageState extends State<ForgotPasswordPage> {
                 onPressed: () => Navigator.pop(context),
                 child: Text(
                   "Back to Login",
-                  style: GoogleFonts.poppins(
+                  style: GoogleFonts.alice(
                     color: Colors.black54,
                     fontSize: 14,
                   ),

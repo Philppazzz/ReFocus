@@ -127,7 +127,7 @@ class _PINSetupPageState extends State<PINSetupPage> {
               // Subtitle
               Text(
                 "Create a 4-digit PIN for password recovery",
-                style: GoogleFonts.poppins(
+                style: GoogleFonts.alice(
                   fontSize: 14,
                   color: Colors.black54,
                 ),
@@ -245,7 +245,7 @@ class _PINSetupPageState extends State<PINSetupPage> {
                 onPressed: () => Navigator.pop(context),
                 child: Text(
                   "Skip",
-                  style: GoogleFonts.poppins(
+                  style: GoogleFonts.alice(
                     color: Colors.black54,
                     fontSize: 14,
                   ),

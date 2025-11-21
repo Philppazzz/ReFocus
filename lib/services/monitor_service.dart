@@ -1,12 +1,18 @@
 import 'dart:async';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:usage_stats/usage_stats.dart';
 import 'package:refocus_app/services/usage_service.dart';
 import 'package:refocus_app/services/lock_state_manager.dart';
 import 'package:refocus_app/services/notification_service.dart';
-import 'package:refocus_app/services/selected_apps.dart';
-import 'package:refocus_app/services/lstm_bridge.dart';
+import 'package:refocus_app/services/usage_monitoring_service.dart';
+import 'package:refocus_app/services/hybrid_lock_manager.dart';
+import 'package:refocus_app/services/app_categorization_service.dart';
+import 'package:refocus_app/services/proactive_feedback_service.dart';
+import 'package:refocus_app/services/learning_mode_manager.dart';
+import 'package:refocus_app/services/app_name_service.dart';
 import 'package:refocus_app/database_helper.dart';
+import 'package:refocus_app/utils/category_mapper.dart';
 import 'package:flutter/material.dart';
 import 'package:refocus_app/pages/lock_screen.dart';
 import 'package:refocus_app/pages/home_page.dart'; // For AppState
@@ -20,24 +26,10 @@ class MonitorService {
   static bool _lockVisible = false;
   static bool _usagePermissionGranted = false;
   
-  // Cache to reduce database calls
-  // ✅ Reduced to 1 second for faster usage accumulation (especially for small limits like 1.1 minutes)
-  static Map<String, dynamic>? _cachedStats;
-  static DateTime? _lastStatsFetch;
-  static const _statsCacheDuration = Duration(seconds: 1);
-  
-  // Cache stats for 1 second to avoid excessive database queries
-  static Future<bool> _shouldUseCache() async {
-    return true; // Always use cache (1 second duration)
-  }
+  // Cache removed - usage stats are now saved directly to database via UsageService
 
   /// Manually trigger limit check (for testing)
-  /// Clears cache to ensure fresh data check
   static Future<void> checkLimits() async {
-    // Clear cache to force fresh stats fetch
-    _cachedStats = null;
-    _lastStatsFetch = null;
-    
     // Reset lock visibility flag to allow new lock screen if needed
     _lockVisible = false;
     
@@ -48,14 +40,12 @@ class MonitorService {
   /// Clear lock state (allows lock screen to be re-shown)
   static void clearLockState() {
     _lockVisible = false;
-    print("🔓 Lock state cleared in MonitorService");
   }
   
   /// Clear stats cache (force fresh data fetch)
+  /// Note: Cache removed - stats are saved directly to database
   static void clearStatsCache() {
-    _cachedStats = null;
-    _lastStatsFetch = null;
-    print("🔄 Stats cache cleared");
+    // No-op: Stats are now saved directly to database via UsageService
   }
   
   /// Clear active app cache (prevent usage accumulation during lock screen)
@@ -82,40 +72,85 @@ class MonitorService {
       return;
     }
 
-    print("🔍 Starting app monitor service...");
     _isMonitoring = true;
 
-    // Ensure usage permission for foreground detection
-    _usagePermissionGranted = await UsageService.requestPermission();
+    // ✅ AppLockManager is ready to use (no initialization needed)
+    print("✅ AppLockManager ready - using rule-based lock logic");
+
+    // Check usage permission silently (don't request yet - will request when needed)
+    _usagePermissionGranted = await UsageStats.checkUsagePermission() ?? false;
     if (!_usagePermissionGranted) {
-      print('⚠️ Usage access not granted – foreground detection may fail');
+      print('⚠️ Usage access not granted yet – will request when first needed');
+    } else {
+      print('✅ Usage access already granted');
     }
+
+    // ✅ Start category-based monitoring service
+    print("🚀 Starting category-based monitoring service...");
+    final categoryMonitoring = UsageMonitoringService();
+    await categoryMonitoring.startMonitoring();
 
     // Start a foreground service to keep the Dart isolate alive in background
     // This is the proper Android way to keep app running in background
+    // ✅ CRITICAL: Foreground service enables proactive feedback from any app
     try {
       if (!await FlutterForegroundTask.isRunningService) {
         await FlutterForegroundTask.startService(
           notificationTitle: 'ReFocus is monitoring',
           notificationText: 'Keeping you focused on your goals',
         );
-        print("✅ Foreground service started");
+        print("✅ Foreground service started - Proactive feedback will work from any app");
       } else {
-        print("ℹ️ Foreground service already running");
+        print("ℹ️ Foreground service already running - Proactive feedback active");
+      }
+      
+      // ✅ VERIFICATION: Verify service is actually running
+      final isRunning = await FlutterForegroundTask.isRunningService;
+      if (isRunning) {
+        print("✅ VERIFIED: Foreground service is running - Background monitoring active");
+      } else {
+        print("⚠️ WARNING: Foreground service reported as not running - Proactive feedback may not work from other apps");
       }
     } catch (e) {
-      print('⚠️ Unable to start foreground service: $e');
+      print('⚠️ ERROR: Unable to start foreground service: $e');
+      print('⚠️ WARNING: Proactive feedback will only work when ReFocus is open');
       // Continue even if service fails - timer will still work while app is in memory
     }
 
     // Start monitoring with optimized intervals
-    // Check every 1 second for more reliable locking (faster response to violations)
+    // ✅ CRITICAL FIX: Check every 200ms for session tracking (matches daily usage speed)
+    // Daily usage updates continuously from Android events, so session should update frequently too
+    // This ensures session tracking is as accurate and responsive as daily usage
+    // ✅ CRITICAL: This timer enables proactive feedback checks from any app
     _monitorTimer?.cancel(); // Cancel any existing timer first
-    _monitorTimer = Timer.periodic(const Duration(seconds: 1), (timer) async {
+    _monitorTimer = Timer.periodic(const Duration(milliseconds: 200), (timer) async {
       if (!_isMonitoring) {
         print("⚠️ Monitoring timer running but _isMonitoring is false - canceling");
         timer.cancel();
         return;
+      }
+      
+      // ✅ VERIFICATION: Periodically check if foreground service is still running
+      // Check every 5 seconds (25 ticks at 200ms interval) to avoid excessive logging
+      if (timer.tick % 25 == 0) {
+        try {
+          final isServiceRunning = await FlutterForegroundTask.isRunningService;
+          if (!isServiceRunning) {
+            print("⚠️ WARNING: Foreground service stopped at tick ${timer.tick} - Attempting restart...");
+            // Try to restart foreground service
+            try {
+              await FlutterForegroundTask.startService(
+                notificationTitle: 'ReFocus is monitoring',
+                notificationText: 'Keeping you focused on your goals',
+              );
+              print("✅ Foreground service restarted successfully");
+            } catch (e) {
+              print("⚠️ ERROR: Failed to restart foreground service: $e");
+            }
+          }
+        } catch (e) {
+          print("⚠️ Error checking foreground service status: $e");
+        }
       }
       
       try {
@@ -125,27 +160,9 @@ class MonitorService {
         // Continue monitoring even if one check fails
       }
     });
-    
-    print("✅ Monitoring timer started - will check every 1 second");
-    
-    // Start periodic LSTM training snapshot logging (every 5 minutes)
-    _startLSTMTrainingLogger();
-    
-    print("✅ Monitoring service started - tracking active");
-  }
 
-  /// Start periodic LSTM training data logger
-  static Timer? _lstmLoggerTimer;
-  static void _startLSTMTrainingLogger() {
-    _lstmLoggerTimer?.cancel();
-    // Log training snapshot every 5 minutes
-    _lstmLoggerTimer = Timer.periodic(const Duration(minutes: 5), (timer) async {
-      try {
-        await LSTMBridge.logTrainingSnapshot();
-      } catch (e) {
-        print("⚠️ Error logging LSTM training snapshot: $e");
-      }
-    });
+    print("✅ Monitoring timer started - will check every 200ms (matches daily usage speed)");
+    print("✅ Monitoring service started - tracking active");
   }
 
   /// Stop monitoring
@@ -154,10 +171,6 @@ class MonitorService {
     _isMonitoring = false;
     _monitorTimer?.cancel();
     _monitorTimer = null;
-    _lstmLoggerTimer?.cancel();
-    _lstmLoggerTimer = null;
-    _cachedStats = null;
-    _lastStatsFetch = null;
     
     try {
       FlutterForegroundTask.stopService();
@@ -170,38 +183,57 @@ class MonitorService {
   /// Restart monitoring (useful after app resumes from background)
   /// Ensures service is running even if it was killed by the system
   static Future<void> restartMonitoring() async {
-    print("🔄 RestartMonitoring called - _isMonitoring = $_isMonitoring");
     
     if (_isMonitoring) {
       // Service is already running, just verify foreground service is active
       try {
         final isServiceRunning = await FlutterForegroundTask.isRunningService;
         if (!isServiceRunning) {
-          print("⚠️ Service was killed - restarting foreground service...");
+          print("⚠️ WARNING: Service was killed - restarting foreground service...");
+          print("⚠️ Without foreground service, proactive feedback will only work when ReFocus is open");
           // Restart foreground service without stopping monitoring
           try {
             await FlutterForegroundTask.startService(
               notificationTitle: 'ReFocus is monitoring',
               notificationText: 'Keeping you focused on your goals',
             );
-            print("✅ Foreground service restarted");
+            print("✅ Foreground service restarted - Proactive feedback restored");
+            
+            // Verify restart was successful
+            final verifyRunning = await FlutterForegroundTask.isRunningService;
+            if (verifyRunning) {
+              print("✅ VERIFIED: Foreground service is now running");
+            } else {
+              print("❌ ERROR: Foreground service restart failed - verification failed");
+            }
           } catch (e) {
-            print("⚠️ Could not restart foreground service: $e");
+            print("❌ ERROR: Could not restart foreground service: $e");
+            print("⚠️ Proactive feedback will only work when ReFocus app is open");
           }
         } else {
-          print("✅ Foreground service is running");
+          print("✅ VERIFIED: Foreground service is running - Proactive feedback active from any app");
         }
       } catch (e) {
         print("⚠️ Error checking service status: $e");
         // Try to restart foreground service anyway
+        // ✅ CRITICAL: Foreground service enables proactive feedback from any app
         try {
           await FlutterForegroundTask.startService(
             notificationTitle: 'ReFocus is monitoring',
             notificationText: 'Keeping you focused on your goals',
           );
-          print("✅ Foreground service started");
+          print("✅ Foreground service started - Proactive feedback enabled");
+          
+          // Verify service started successfully
+          final verifyRunning = await FlutterForegroundTask.isRunningService;
+          if (verifyRunning) {
+            print("✅ VERIFIED: Foreground service is running - Background monitoring active");
+          } else {
+            print("⚠️ WARNING: Foreground service start reported success but verification failed");
+          }
         } catch (e2) {
-          print("⚠️ Could not restart service: $e2");
+          print("❌ ERROR: Could not restart service: $e2");
+          print("⚠️ Proactive feedback will only work when ReFocus app is open");
         }
       }
       
@@ -209,7 +241,7 @@ class MonitorService {
       if (_monitorTimer == null || !_monitorTimer!.isActive) {
         print("⚠️ Monitoring timer is not active - recreating timer...");
         _monitorTimer?.cancel();
-        _monitorTimer = Timer.periodic(const Duration(seconds: 1), (timer) async {
+        _monitorTimer = Timer.periodic(const Duration(milliseconds: 200), (timer) async {
           if (!_isMonitoring) {
             print("⚠️ Monitoring timer running but _isMonitoring is false - canceling");
             timer.cancel();
@@ -226,7 +258,6 @@ class MonitorService {
       }
       
       // ✅ CRITICAL: Force an immediate check after restart to ensure tracking resumes
-      print("🔄 Forcing immediate check after restart...");
       await _checkForegroundApp();
       print("✅ Immediate check completed - monitoring should be active");
     } else {
@@ -237,36 +268,6 @@ class MonitorService {
     }
     
     print("✅ RestartMonitoring completed - _isMonitoring = $_isMonitoring, timer active = ${_monitorTimer?.isActive ?? false}");
-  }
-
-  /// Get cached stats or fetch fresh ones
-  /// ✅ CRITICAL: Pass currentForegroundApp for real-time usage tracking
-  static Future<Map<String, dynamic>> _getStats({
-    bool updateSessionTracking = true,
-    String? currentForegroundApp,
-  }) async {
-    final now = DateTime.now();
-    final useCache = await _shouldUseCache();
-    
-    // Return cached if still valid
-    if (useCache && 
-        _cachedStats != null && 
-        _lastStatsFetch != null &&
-        now.difference(_lastStatsFetch!) < _statsCacheDuration) {
-      return _cachedStats!;
-    }
-
-    // Fetch fresh stats (when cache expired)
-    // ✅ CRITICAL: Pass currentForegroundApp for real-time usage accumulation
-    // Pass updateSessionTracking flag to prevent session restart during cooldown
-    _cachedStats = await UsageService.getUsageStatsWithEvents(
-      SelectedAppsManager.selectedApps,
-      currentForegroundApp: currentForegroundApp, // ✅ Enable real-time tracking!
-      updateSessionTracking: updateSessionTracking,
-    );
-    _lastStatsFetch = now;
-    
-    return _cachedStats!;
   }
 
   /// Check foreground app and enforce limits
@@ -287,22 +288,25 @@ class MonitorService {
       final prefs = await SharedPreferences.getInstance();
       
       // Get current foreground app
-      final foregroundApp = await platform.invokeMethod<String>('getForegroundApp');
+      String? foregroundApp;
+      try {
+        foregroundApp = await platform.invokeMethod<String>('getForegroundApp');
+      } catch (e) {
+        print('⚠️ Error getting foreground app: $e');
+        // ✅ EDGE CASE: Permission might be revoked
+        // Continue monitoring - will retry next cycle
+        return;
+      }
 
+      // ✅ NULL SAFETY: Validate foreground app
       if (foregroundApp == null || foregroundApp.isEmpty) {
         // No app in foreground - user might be on home screen
         return;
       }
 
-      // Identify our own app and selected apps
-      final isOwnApp = foregroundApp == 'com.example.refocus_app';
-
-      final selectedPackages = SelectedAppsManager.selectedApps
-          .map((a) => a['package'])
-          .whereType<String>()
-          .where((p) => p.isNotEmpty)
-          .toSet();
-      final isSelected = selectedPackages.contains(foregroundApp);
+      // Check if we're tracking this app (exclude system apps and messaging apps)
+      final isTracked = !CategoryMapper.isSystemApp(foregroundApp) && 
+                        !CategoryMapper.isMessagingApp(foregroundApp);
 
       // PRIORITY 0: Check for grace period (prevents immediate re-lock)
       final gracePeriodEnd = prefs.getInt('grace_period_end');
@@ -327,10 +331,10 @@ class MonitorService {
         final lockInfo = cooldownInfo;
         print("🔒 Active lock detected: ${lockInfo['reason']}");
         
-        // ✅ CRITICAL FIX: ALWAYS enforce lock when user is on a selected app
+        // ✅ CRITICAL FIX: ALWAYS enforce lock when user is on a tracked app
         // This works even if app was closed/killed and reopened
         // Don't check _lockVisible flag - force show every time to prevent bypass
-        if (isSelected) {
+        if (isTracked) {
           print("🚨 User on locked app ($foregroundApp) during ${lockInfo['reason']} - enforcing lock");
           await _bringAppToForeground();
           await Future.delayed(const Duration(milliseconds: 500));
@@ -358,13 +362,6 @@ class MonitorService {
       // ✅ CRITICAL: If Emergency Override is enabled, stop all tracking and skip violations
       // (Already checked above, but keeping for clarity)
       
-      // DEBUG: Show current session status
-      final sessionMinutes = await LockStateManager.getCurrentSessionMinutes();
-      final isSessionLimitExceeded = await LockStateManager.isSessionLimitExceeded();
-      print("🔍 Session: ${sessionMinutes.toStringAsFixed(1)}m | Exceeded: $isSessionLimitExceeded");
-      
-      final updateSessionTracking = !hasActiveLock; // Only update session if no lock active
-      
       // ✅ CRITICAL: Track cooldown state for cache clearing when cooldown ends
       final wasInCooldown = prefs.getBool('_was_in_cooldown') ?? false;
       if (hasActiveLock && !wasInCooldown) {
@@ -383,84 +380,115 @@ class MonitorService {
         // This ensures unlock tracking resumes immediately after cooldown
         // Check if we just transitioned from cooldown to no cooldown
         if (wasInCooldown) {
-          print('🔄 Cooldown just ended - clearing cache and resuming unlock tracking');
           clearStatsCache();
           await prefs.setBool('_was_in_cooldown', false);
           
           // ✅ CRITICAL: Force immediate violation check after cooldown ends
           // This ensures unlock limit is checked immediately when user opens apps
-          print('🔄 Forcing immediate violation check after cooldown ended');
           // The check will happen naturally in the next lines, but we ensure cache is cleared
         }
       }
 
-      // PRIORITY 2: Update session activity ONLY for selected apps
-      // ✅ CRITICAL: Session tracking ONLY happens for selected apps (not all phone apps)
-      // IMPORTANT: Session continues across app switches - switching between selected apps
-      // doesn't reset the session timer. Only switching to unselected apps or cooldown resets it.
-      if (isSelected) {
-        await LockStateManager.updateSessionActivity();
-        print("📱 Session activity updated for $foregroundApp (selected app only - session continues across switches)");
-      }
-      // ✅ NO session tracking for ReFocus app or non-selected apps!
-
-      // PRIORITY 2.5: Check and send warnings ONLY for selected apps
-      if (isSelected) {
-        final stats = await _getStats(
-          updateSessionTracking: updateSessionTracking,
-          currentForegroundApp: foregroundApp, // ✅ Pass for real-time tracking
-        );
-        final dailyHours = (stats['daily_usage_hours'] as num?)?.toDouble() ?? 0.0;
-        final sessionMinutes = await LockStateManager.getCurrentSessionMinutes();
-        final totalUnlocks = (stats['most_unlock_count'] as num?)?.toInt() ?? 0;
-        String? mostUnlockedAppName = (stats['most_unlock_app'] as String?)?.trim();
-        if (mostUnlockedAppName != null &&
-            (mostUnlockedAppName.isEmpty || mostUnlockedAppName.toLowerCase() == 'none')) {
-          mostUnlockedAppName = null;
-        }
-        final remainingUnlocks = await LockStateManager.getRemainingUnlocks(totalUnlocks);
-
-        String? currentAppName;
-        if (isSelected) {
+      // PRIORITY 2: Update session activity ONLY for Social, Games, Entertainment categories
+      // ✅ CRITICAL: Session tracking ONLY happens for monitored categories (Social, Games, Entertainment)
+      // IMPORTANT: Session continues across app switches between these 3 categories
+      // doesn't reset the session timer. Only switching to "Others" or system apps or cooldown resets it.
+      // ✅ CRITICAL FIX: Session tracking happens BEFORE early returns for violations
+      // This ensures session time accumulates even if we skip violation checks
+      if (isTracked && !hasActiveLock) {
+        // Check if app is in monitored category (Social, Games, Entertainment)
+        final category = await AppCategorizationService.getCategoryForPackage(foregroundApp);
+        final monitoredCategories = ['Social', 'Games', 'Entertainment'];
+        
+        if (monitoredCategories.contains(category)) {
+          // ✅ Update LockStateManager (for lock decisions - milliseconds-based, more accurate)
+          // This accumulates session time in milliseconds and handles 5-minute inactivity threshold
+          // ✅ CRITICAL FIX: This is now called every 200ms (instead of 1 second), matching daily usage speed
+          // Daily usage updates continuously from Android events, so session should update frequently too
           try {
-            final app = SelectedAppsManager.selectedApps.firstWhere(
-              (app) => app['package'] == foregroundApp,
-            );
-            currentAppName = app['name'] ?? app['package'];
-          } catch (_) {
-            currentAppName = null;
+            await LockStateManager.updateSessionActivity();
+            
+            // ✅ OPTIMIZED: Only log every 5 seconds to reduce log spam while maintaining verification
+            // Get current session to verify it's updating (but don't log every time)
+            final now = DateTime.now();
+            if (now.second % 5 == 0 && now.millisecond < 200) {
+              final currentSession = await LockStateManager.getCurrentSessionMinutes();
+              print("📱 Session activity updated for $foregroundApp ($category) - Current session: ${currentSession.toStringAsFixed(2)}min");
+            }
+          } catch (e) {
+            print("⚠️ Error updating session activity: $e");
+            // Continue - don't break monitoring if session update fails
+          }
+        } else {
+          // Not a monitored category - session tracking paused but not reset
+          final currentSession = await LockStateManager.getCurrentSessionMinutes();
+          if (currentSession > 0) {
+            print("📱 Session paused (not reset) for $foregroundApp ($category - not monitored) - Session remains: ${currentSession.toStringAsFixed(2)}min");
+          } else {
+            print("📱 Skipping session tracking for $foregroundApp ($category - not monitored)");
           }
         }
+      } else if (hasActiveLock) {
+        // Active lock - session tracking is paused (handled in LockStateManager.updateSessionActivity)
+        print("🔒 Session tracking paused - active lock detected");
+      }
+      // ✅ NO session tracking for ReFocus app, system apps, or "Others" category!
+      
+      // ✅ CRITICAL: Save usage stats to database (for frontend display)
+      // This ensures home_page and dashboard_screen can read accurate data
+      // Only save if not in cooldown/lock (to prevent accumulation during lock)
+      if (isTracked && !hasActiveLock) {
+        try {
+          // Call UsageService to process events and save to database
+          // This updates SharedPreferences AND saves to SQLite database
+          await UsageService.getUsageStatsWithEvents(
+            currentForegroundApp: foregroundApp,
+            updateSessionTracking: true,
+          );
+          print("💾 Usage stats saved to database for $foregroundApp");
+        } catch (e) {
+          print("⚠️ Error saving usage stats: $e");
+          // Don't throw - continue with violation checks
+        }
+      }
+
+      // PRIORITY 2.5: Check and send warnings ONLY for tracked apps
+      if (isTracked) {
+        // ✅ Calculate daily usage excluding "Others" category (only monitored categories count towards limit)
+        final db = DatabaseHelper.instance;
+        final categoryUsage = await db.getCategoryUsageForDate(DateTime.now());
+        final monitoredDailyMinutes = (categoryUsage['Social'] ?? 0.0) +
+                                       (categoryUsage['Games'] ?? 0.0) +
+                                       (categoryUsage['Entertainment'] ?? 0.0);
+        final dailyHours = monitoredDailyMinutes / 60.0;
+        
+        final sessionMinutes = await LockStateManager.getCurrentSessionMinutes();
+
+        String? currentAppName = foregroundApp;
 
         // Get thresholds from LockStateManager
         final thresholds = await LockStateManager.getThresholds();
         final dailyLimit = thresholds['dailyHours'] as double;
         final sessionLimit = thresholds['sessionMinutes'] as double;
-        final unlockLimit = thresholds['unlockLimit'] as int;
 
-        // ✅ PRIORITY: Check and send warnings BEFORE checking violations
+        // ✅ Check and send warnings BEFORE checking violations
         // This ensures users are ALWAYS warned before they get locked
         await NotificationService.checkAndSendWarnings(
           dailyHours: dailyHours,
           sessionMinutes: sessionMinutes,
-          unlockCount: totalUnlocks,
           dailyLimit: dailyLimit,
           sessionLimit: sessionLimit,
-          unlockLimit: unlockLimit,
           currentAppName: currentAppName,
-          mostUnlockedAppName: mostUnlockedAppName,
-          remainingUnlocks: remainingUnlocks,
         );
         
-        // ✅ CRITICAL: Send final warning if user is VERY close to limit (95%+)
+        // ✅ Send final warning if user is VERY close to limit (95%+)
         // This is a last-minute alert right before violation occurs
         final dailyPercentage = dailyHours / dailyLimit;
         final sessionPercentage = sessionMinutes / sessionLimit;
-        final unlockPercentage = totalUnlocks / unlockLimit;
-        
+
         final today = DateTime.now().toIso8601String().substring(0, 10);
         final prefs = await SharedPreferences.getInstance();
-        
+
         // Final warning for daily limit (95%+)
         if (dailyPercentage >= 0.95 && dailyPercentage < 1.0) {
           final warningKey = 'daily_final_warning_$today';
@@ -473,7 +501,7 @@ class MonitorService {
             await prefs.setBool(warningKey, true);
           }
         }
-        
+
         // Final warning for session limit (95%+)
         if (sessionPercentage >= 0.95 && sessionPercentage < 1.0) {
           final warningKey = 'session_final_warning_$today';
@@ -487,21 +515,6 @@ class MonitorService {
             await prefs.setBool(warningKey, true);
           }
         }
-        
-        // Final warning for unlock limit (95%+)
-        if (unlockPercentage >= 0.95 && unlockPercentage < 1.0) {
-          final warningKey = 'unlock_final_warning_$today';
-          if (!(prefs.getBool(warningKey) ?? false)) {
-            await NotificationService.showUnlockLimitWarning(
-              totalUnlocks,
-              unlockLimit,
-              warningLevel: 95,
-              mostUnlockedAppName: mostUnlockedAppName,
-              remainingUnlocks: remainingUnlocks,
-            );
-            await prefs.setBool(warningKey, true);
-          }
-        }
 
         // Check and reward good behavior (decrease violations if user behaves well)
         // Only check every 5 minutes to avoid excessive checks
@@ -511,64 +524,210 @@ class MonitorService {
           await LockStateManager.checkAndRewardGoodBehavior();
           await prefs.setInt('last_good_behavior_check', now);
         }
+
+        // PRIORITY 2.6: Check for proactive feedback (learning mode only)
+        // This works from any app, not just HomePage
+        // ✅ CRITICAL: Works in background via foreground service
+        if (await LearningModeManager.shouldShowProactiveFeedback()) {
+          try {
+            // Get category for current app
+            final category = await AppCategorizationService.getCategoryForPackage(foregroundApp);
+            
+            // ✅ CRITICAL: Sync usage from database before checking proactive feedback
+            // This ensures we detect 50% threshold accurately, even in background
+            // Database is updated by UsageService which processes Android UsageStats
+            final db = DatabaseHelper.instance;
+            final categoryUsage = await db.getCategoryUsageForDate(DateTime.now());
+            
+            // ✅ For monitored categories (Social/Games/Entertainment), use COMBINED usage
+            // This matches how lock decisions work (shared limits system)
+            final monitoredCategories = ['Social', 'Games', 'Entertainment'];
+            int categoryDailyUsage;
+            if (monitoredCategories.contains(category)) {
+              // Combined daily usage for monitored categories
+              categoryDailyUsage = ((categoryUsage['Social'] ?? 0.0) +
+                                   (categoryUsage['Games'] ?? 0.0) +
+                                   (categoryUsage['Entertainment'] ?? 0.0)).round();
+            } else {
+              // Per-category usage for Others
+              categoryDailyUsage = (categoryUsage[category] ?? 0.0).round();
+            }
+            
+            // ✅ CRITICAL: Get session usage from LockStateManager (source of truth)
+            // LockStateManager tracks continuous session across monitored categories
+            // with 5-minute inactivity threshold
+            final categorySessionUsage = await LockStateManager.getCurrentSessionMinutes();
+            
+            print('📊 Proactive feedback check: $category - Daily: $categoryDailyUsage min, Session: ${categorySessionUsage.toStringAsFixed(1)} min');
+
+            // Check if we should show proactive feedback
+            final promptResult = await ProactiveFeedbackService.shouldShowPrompt(
+              category: category,
+              sessionUsageMinutes: categorySessionUsage.round(),
+              dailyUsageMinutes: categoryDailyUsage,
+            );
+
+            if (promptResult['shouldShow'] as bool) {
+              final usageLevel = promptResult['usageLevel'] as int;
+              final isOveruse = promptResult['isOveruse'] as bool? ?? false;
+              final reason = promptResult['reason'] as String? ?? 'Usage milestone';
+              
+              // Get app name
+              final appName = await AppNameService.getAppName(foregroundApp);
+
+              // ✅ VERIFICATION: Log that we're about to show notification
+              print('📢 PROACTIVE FEEDBACK: Showing notification for $appName ($category)');
+              print('   Current app: $foregroundApp');
+              print('   Usage: ${categoryDailyUsage}min daily, ${categorySessionUsage.toStringAsFixed(1)}min session');
+              print('   Reason: $reason');
+              
+              // Verify foreground service is running before showing notification
+              try {
+                final isServiceRunning = await FlutterForegroundTask.isRunningService;
+                if (!isServiceRunning) {
+                  print('⚠️ WARNING: Foreground service not running - Notification may not appear from other apps');
+                } else {
+                  print('✅ VERIFIED: Foreground service running - Notification will appear from any app');
+                }
+              } catch (e) {
+                print('⚠️ Error checking service status: $e');
+              }
+
+              // Show proactive feedback notification (works from any app)
+              // Create custom message for overuse detection
+              String? customMessage;
+              if (isOveruse) {
+                customMessage = '$reason\nWould a break be helpful now?';
+              }
+              
+              try {
+                await NotificationService.showProactiveFeedbackNotification(
+                  appName: appName,
+                  category: category,
+                  sessionUsageMinutes: categorySessionUsage.round(),
+                  dailyUsageMinutes: categoryDailyUsage,
+                  usageLevel: usageLevel,
+                  customMessage: customMessage,
+                );
+                print('✅ PROACTIVE FEEDBACK: Notification sent successfully for $appName');
+              } catch (e) {
+                print('❌ ERROR: Failed to show proactive feedback notification: $e');
+                print('   This may prevent feedback collection from other apps');
+              }
+
+            } else {
+              // Log why feedback wasn't shown (for debugging)
+              final reason = promptResult['reason'] as String? ?? 'Unknown';
+              if (reason != 'Cooldown active' && reason != 'Session too short') {
+                // Only log non-trivial reasons to avoid spam
+                print('📊 Proactive feedback skipped: $reason');
+              }
+            }
+          } catch (e) {
+            print('⚠️ Error checking proactive feedback: $e');
+            // Don't throw - continue with violation checks
+          }
+        }
       }
 
-      // PRIORITY 3: Check for violations
-      // ✅ CRITICAL: Check in order of severity (most severe first)
-      // 1. Daily limit (most severe - locks until tomorrow)
-      // 2. Session limit (medium - locks for cooldown)
-      // 3. Unlock limit (medium - locks for cooldown)
-      // ✅ CRITICAL FIX: Must check unlock limit even if session limit is exceeded
-      // Both limits can trigger independently
+      // PRIORITY 3: Check for violations using Decision Tree ML predictions
+      // ✅ Decision Tree predicts overuse for each category based on:
+      // - Daily usage (in minutes)
+      // - Current session usage (in minutes)
+      // - Time of day (hour 0-23)
+      // - Category (Social, Games, Entertainment)
       Map<String, dynamic>? violation;
-      
-      // Get thresholds first (for logging)
-      final thresholds = await LockStateManager.getThresholds();
-      
-      // ✅ CRITICAL: Clear cache before violation checks to ensure fresh unlock counts
-      // Unlocks can happen quickly and cache might have stale data
+
+
+      // Clear cache before violation checks
       clearStatsCache();
-      
-      // Get stats first (needed for daily limit check)
-      // ✅ CRITICAL: Pass foregroundApp for real-time usage tracking
-      final stats = await _getStats(
-        updateSessionTracking: updateSessionTracking,
-        currentForegroundApp: foregroundApp, // ✅ Enable real-time tracking!
-      );
-      final dailyHours = (stats['daily_usage_hours'] as num?)?.toDouble() ?? 0.0;
-      final totalUnlocks = (stats['most_unlock_count'] as num?)?.toInt() ?? 0;
 
-      print("📊 Current stats - Daily: ${dailyHours.toStringAsFixed(4)}h (${(dailyHours * 60).toStringAsFixed(1)}m) / ${thresholds['dailyHours']}h (${(thresholds['dailyHours'] * 60).toStringAsFixed(1)}m), Unlocks: $totalUnlocks / ${thresholds['unlockLimit']}");
-      print("   🔍 Foreground app: $foregroundApp | Is selected: $isSelected");
-      print("   🔍 Checking unlock limit: $totalUnlocks unlocks (limit: ${thresholds['unlockLimit']})");
+      // ✅ Calculate daily usage excluding "Others" category (only monitored categories count towards limit)
+      final db = DatabaseHelper.instance;
+      final categoryUsage = await db.getCategoryUsageForDate(DateTime.now());
+      final monitoredDailyMinutes = (categoryUsage['Social'] ?? 0.0) +
+                                     (categoryUsage['Games'] ?? 0.0) +
+                                     (categoryUsage['Entertainment'] ?? 0.0);
+      final dailyHours = monitoredDailyMinutes / 60.0;
 
-      // ✅ CRITICAL FIX: Check unlock limit FIRST (before daily/session) to ensure it's always checked
-      // This ensures unlock limit is checked independently of other limits
-      final isUnlockLimitExceeded = await LockStateManager.isUnlockLimitExceeded(totalUnlocks);
-      if (isUnlockLimitExceeded) {
-        violation = {
-          'type': 'unlock_limit',
-          'message': 'Unlock limit reached',
-        };
-        print("🚨🚨🚨 UNLOCK LIMIT EXCEEDED FIRST! 🚨🚨🚨");
+
+      // ✅ DECISION TREE INTEGRATION: Check if current app's category should be locked
+      if (isTracked) {
+        try {
+          // Get category for current app
+          final category = await AppCategorizationService.getCategoryForPackage(foregroundApp);
+
+          // Get category-specific usage
+          final monitoringService = UsageMonitoringService();
+          // ✅ FIX: dailyUsage and sessionUsage are already in MINUTES, not seconds!
+          final categoryDailyMins = monitoringService.dailyUsage[category] ?? 0;
+          final categorySessionMins = monitoringService.sessionUsage[category] ?? 0;
+
+          // Get current time of day
+          final now = DateTime.now();
+          final timeOfDay = now.hour;
+
+
+          // ✅ Hybrid lock manager: ML when ready, rule-based as fallback
+          final lockResult = await HybridLockManager.shouldLockApp(
+            category: category,
+            dailyUsageMinutes: categoryDailyMins,
+            sessionUsageMinutes: categorySessionMins,
+            currentHour: timeOfDay,
+            appName: foregroundApp,
+            packageName: foregroundApp,
+          );
+
+          final shouldLock = lockResult['shouldLock'] as bool;
+          final predictionSource = lockResult['source'] as String;
+          final lockReason = lockResult['reason'] as String;
+          final confidence = lockResult['confidence'] as double;
+          final shouldAskFeedback = lockResult['shouldAskFeedback'] as bool? ?? false;
+          final feedbackUsageLevel = lockResult['feedbackUsageLevel'] as int?;
+
+          // Check for proactive feedback prompt (learning mode)
+          if (!shouldLock && shouldAskFeedback && feedbackUsageLevel != null) {
+            // This will be handled by UI layer
+            // UI should check lockResult['shouldAskFeedback'] and show dialog
+          }
+
+          if (shouldLock) {
+            violation = {
+              'type': '${predictionSource}_lock',
+              'message': lockReason,
+              'category': category,
+              'prediction_source': predictionSource,
+              'confidence': confidence,
+            };
+            print("🚨🚨🚨 ${predictionSource.toUpperCase()} LOCK: $category! 🚨🚨🚨");
+            print("   Reason: $lockReason");
+            print("   Confidence: ${(confidence * 100).toStringAsFixed(0)}%");
+          }
+        } catch (e) {
+          print("⚠️ Error in lock check: $e");
+          // Continue monitoring even if lock check fails
+        }
       }
-      
-      // Check daily limit (only if unlock limit not exceeded)
-      if (violation == null && await LockStateManager.isDailyLimitExceeded(dailyHours)) {
-        violation = {
-          'type': 'daily_limit',
-          'message': 'Daily limit reached - unlocks tomorrow',
-        };
-        print("🚨🚨🚨 DAILY LIMIT EXCEEDED! 🚨🚨🚨");
-      }
-      
-      // Check session limit (only if no other violation)
-      if (violation == null && await LockStateManager.isSessionLimitExceeded()) {
-        violation = {
-          'type': 'session_limit',
-          'message': 'Continuous usage limit reached',
-        };
-        print("🚨🚨🚨 SESSION LIMIT EXCEEDED! 🚨🚨🚨");
+
+      // Fallback checks if ML didn't trigger lock
+      if (violation == null) {
+        // Check daily limit first (most severe)
+        if (await LockStateManager.isDailyLimitExceeded(dailyHours)) {
+          violation = {
+            'type': 'daily_limit',
+            'message': 'Daily limit reached - unlocks tomorrow',
+          };
+          print("🚨🚨🚨 DAILY LIMIT EXCEEDED! 🚨🚨🚨");
+        }
+
+        // Check session limit (only if daily limit not exceeded)
+        if (violation == null && await LockStateManager.isSessionLimitExceeded()) {
+          violation = {
+            'type': 'session_limit',
+            'message': 'Continuous usage limit reached',
+          };
+          print("🚨🚨🚨 SESSION LIMIT EXCEEDED! 🚨🚨🚨");
+        }
       }
 
       // PRIORITY 4: Handle violation if detected - MUST TRIGGER INSTANTLY
@@ -576,42 +735,32 @@ class MonitorService {
         final limitType = violation['type'];
         print("🚨🚨🚨 VIOLATION DETECTED: $limitType 🚨🚨🚨");
 
-        // Get stats for logging
-        final stats = await _getStats(
-          updateSessionTracking: updateSessionTracking,
-          currentForegroundApp: foregroundApp, // ✅ Pass for real-time tracking
-        );
-        final dailyHours = (stats['daily_usage_hours'] as num?)?.toDouble() ?? 0.0;
-        final sessionMinutes = await LockStateManager.getCurrentSessionMinutes();
-        final totalUnlocks = (stats['most_unlock_count'] as num?)?.toInt() ?? 0;
+        // ✅ Calculate daily usage excluding "Others" category (only monitored categories count towards limit)
+        final db = DatabaseHelper.instance;
+        final categoryUsage = await db.getCategoryUsageForDate(DateTime.now());
+        final monitoredDailyMinutes = (categoryUsage['Social'] ?? 0.0) +
+                                       (categoryUsage['Games'] ?? 0.0) +
+                                       (categoryUsage['Entertainment'] ?? 0.0);
+        final dailyHours = monitoredDailyMinutes / 60.0;
         
-        if (limitType == 'unlock_limit') {
-          print("   📱 Unlock limit reached! User opened an app $totalUnlocks times (limit: ${thresholds['unlockLimit']})");
-        }
+        final sessionMinutes = await LockStateManager.getCurrentSessionMinutes();
 
-        // Resolve app name (use most unlocked app for unlock limit, current app for session)
+        // Resolve app name based on violation type
         String appName = 'App';
         String? appPackage;
-        
-        if (limitType == 'unlock_limit') {
-          // For unlock limit, use the most unlocked app
-          appName = stats['most_unlock_app'] ?? 'App';
-          // Find package for this app
-          final app = SelectedAppsManager.selectedApps.firstWhere(
-            (a) => a['name'] == appName,
-            orElse: () => {'package': ''},
-          );
-          appPackage = app['package'];
+
+        if (limitType == 'ml_prediction') {
+          // For ML predictions, use current foreground app and category
+          final category = violation['category'] ?? 'App';
+          appName = '$category apps';
+          appPackage = foregroundApp;
         } else if (limitType == 'session_limit') {
           // For session limit, use current foreground app
-          final app = SelectedAppsManager.selectedApps.firstWhere(
-            (app) => app['package'] == foregroundApp,
-            orElse: () => {'name': 'App', 'package': ''},
-          );
-          appName = app['name'] ?? 'App';
-          appPackage = app['package'];
+          appName = foregroundApp;
+          appPackage = foregroundApp;
         } else if (limitType == 'daily_limit') {
           appName = 'All Apps';
+          appPackage = '';
         }
 
         // Special handling for daily limit
@@ -632,10 +781,10 @@ class MonitorService {
 
           print("🔒 Daily lock activated (will show when user tries selected app)");
 
-          // ✅ CRITICAL FIX: Always show lock screen when user opens selected app during daily lock
+          // ✅ CRITICAL FIX: Always show lock screen when user opens tracked app during daily lock
           // This ensures user cannot bypass daily lock by exiting and reopening
-          // The lock screen will appear every time user tries to open a selected app
-          if (isSelected) {
+          // The lock screen will appear every time user tries to open a tracked app
+          if (isTracked) {
             print("🚨 User on locked app during daily limit ($foregroundApp) - enforcing lock");
             await _bringAppToForeground();
             await Future.delayed(const Duration(milliseconds: 500));
@@ -645,24 +794,24 @@ class MonitorService {
               'reason': 'daily_limit',
               'remainingSeconds': -1,
               'appName': appName,
+              'mlSource': null, // Daily limit is always rule-based
+              'mlConfidence': null,
             }, force: true, allowBackNavigation: false);
           }
           
           return;
         }
 
-        // Handle session/unlock violations
-        print("📝 Recording violation for $limitType");
+        // Handle session violation or ML prediction (both use cooldown mechanism)
         await LockStateManager.recordViolation(limitType);
 
         // Get cooldown duration
         final cooldownSeconds = await LockStateManager.getCooldownSeconds(limitType);
-        print("⏱️ Cooldown duration: ${cooldownSeconds}s");
 
-        // Apply side-effects (reset session timer or unlock base)
+        // Apply side-effects (reset session timer)
         await LockStateManager.onViolationApplied(
           limitType: limitType,
-          currentMostUnlockedCount: limitType == 'unlock_limit' ? totalUnlocks : 0,
+          currentMostUnlockedCount: 0, // Not used anymore
         );
 
         // Set cooldown
@@ -678,8 +827,8 @@ class MonitorService {
           appName: appName,
           appPackage: appPackage,
           dailyHours: dailyHours,
-          sessionMinutes: limitType == 'session_limit' ? sessionMinutes : null,
-          unlockCount: limitType == 'unlock_limit' ? totalUnlocks : null,
+          sessionMinutes: sessionMinutes,
+          unlockCount: null, // Unlock count no longer triggers violations
           cooldownSeconds: cooldownSeconds,
         );
 
@@ -689,25 +838,24 @@ class MonitorService {
 
         print("🔒 Cooldown set - showing lock screen immediately");
 
-        // ✅ CRITICAL: For unlock_limit, ALWAYS bring app to foreground
-        // Unlock violations trigger when user OPENS an app, so we must intercept immediately
-        // For session_limit, only bring to foreground if user is on a selected app
-        if (limitType == 'unlock_limit') {
-          // Unlock limit: ALWAYS bring to foreground (happens when opening ANY app)
-          await _bringAppToForeground();
-          await Future.delayed(const Duration(milliseconds: 500));
-          print("🚨 Unlock limit: Brought app to foreground to show lock");
-        } else if (isSelected && !isOwnApp) {
-          // Session limit: Only bring to foreground if user is on selected app
+        // For session_limit or ml_prediction, bring to foreground if user is on a tracked app
+        if ((limitType == 'session_limit' || limitType == 'ml_prediction') && isTracked) {
+          // Bring to foreground if on tracked app
           await _bringAppToForeground();
           await Future.delayed(const Duration(milliseconds: 500));
         }
+
+        // ✅ CRITICAL: Pass ML source and confidence to lock screen for verification
+        final mlSource = violation['prediction_source'] as String?;
+        final mlConfidence = violation['confidence'] as double?;
         
-        // Show lock screen immediately - don't wait for user to be in our app
+        // Show lock screen immediately
         _showLockScreen({
           'reason': limitType,
           'remainingSeconds': cooldownSeconds,
           'appName': appName,
+          'mlSource': mlSource, // ✅ Pass ML source (ensemble, rule_based, etc.)
+          'mlConfidence': mlConfidence, // ✅ Pass ML confidence (0.0-1.0)
         }, force: true);
       }
 
@@ -727,7 +875,16 @@ class MonitorService {
     }
   }
 
+  // ✅ CRITICAL: Add lock to prevent concurrent lock screen calls
+  static bool _isShowingLock = false;
+  
   static void _showLockScreen(Map<String, dynamic> cooldown, {bool force = false, bool allowBackNavigation = false}) {
+    // ✅ CRITICAL: Prevent concurrent lock screen calls (race condition fix)
+    if (_isShowingLock && !force) {
+      print("⚠️ Lock screen call already in progress - BLOCKING duplicate");
+      return;
+    }
+    
     // ✅ CRITICAL FIX: If force=true, always show lock screen (even if already visible)
     // This ensures lock screen appears every time user opens selected app during lock
     if (_lockVisible && !force) {
@@ -737,43 +894,48 @@ class MonitorService {
     
     // If force=true and lock is already visible, reset the flag to allow re-showing
     if (_lockVisible && force) {
-      print("🔄 Force showing lock screen - resetting visibility flag");
       _lockVisible = false;
     }
     
-    final navigator = Nav.navigatorKey.currentState;
-    if (navigator == null) {
-      print("⚠️ Navigator not available - cannot show lock screen");
-      // ✅ CRITICAL: If navigator is not available, try again after a short delay
-      // This handles the case where app is starting up or was closed/reopened
-      Future.delayed(const Duration(milliseconds: 500), () {
-        final retryNavigator = Nav.navigatorKey.currentState;
-        if (retryNavigator != null) {
-          print("✅ Navigator available on retry - showing lock screen");
-          _lockVisible = true;
-          retryNavigator.pushNamed('/lock', arguments: cooldown);
-        } else {
-          print("⚠️ Navigator still not available after retry");
-        }
-      });
-      return;
-    }
+    _isShowingLock = true;
     
-    _lockVisible = true;
-    print("🔒 Showing lock screen for ${cooldown['reason']} - app: ${cooldown['appName']} (allowBackNavigation: $allowBackNavigation)");
-    
-    // ✅ CRITICAL: Clear active app cache to STOP usage accumulation while lock screen is visible
-    _clearActiveAppCache();
-    
-    // ✅ FIX: Use different navigation strategy based on context
-    // - If allowBackNavigation=true: Use push() so users can go back to see stats
-    // - If allowBackNavigation=false: Use pushAndRemoveUntil() to block selected apps
     try {
+      final navigator = Nav.navigatorKey.currentState;
+      if (navigator == null) {
+        print("⚠️ Navigator not available - cannot show lock screen");
+        // ✅ CRITICAL: If navigator is not available, try again after a short delay
+        // This handles the case where app is starting up or was closed/reopened
+        Future.delayed(const Duration(milliseconds: 500), () {
+          final retryNavigator = Nav.navigatorKey.currentState;
+          if (retryNavigator != null) {
+            print("✅ Navigator available on retry - showing lock screen");
+            _lockVisible = true;
+            retryNavigator.pushNamed('/lock', arguments: cooldown);
+            _isShowingLock = false;
+          } else {
+            print("⚠️ Navigator still not available after retry");
+            _isShowingLock = false;
+          }
+        });
+        return;
+      }
+      
+      _lockVisible = true;
+      print("🔒 Showing lock screen for ${cooldown['reason']} - app: ${cooldown['appName']} (allowBackNavigation: $allowBackNavigation)");
+      
+      // ✅ CRITICAL: Clear active app cache to STOP usage accumulation while lock screen is visible
+      _clearActiveAppCache();
+      
+      // ✅ FIX: Use different navigation strategy based on context
+      // - If allowBackNavigation=true: Use push() so users can go back to see stats
+      // - If allowBackNavigation=false: Use pushAndRemoveUntil() to block selected apps
       final lockScreenRoute = MaterialPageRoute(
         builder: (_) => LockScreen(
           reason: cooldown['reason'],
           cooldownSeconds: cooldown['remainingSeconds'],
           appName: cooldown['appName'],
+          mlSource: cooldown['mlSource'] as String?, // ✅ Pass ML source
+          mlConfidence: (cooldown['mlConfidence'] as num?)?.toDouble(), // ✅ Pass ML confidence
         ),
         fullscreenDialog: true,
         settings: const RouteSettings(name: '/lock_screen'),
@@ -783,9 +945,10 @@ class MonitorService {
         // ✅ In ReFocus app: Allow back navigation to see stats/homepage
         navigator.push(lockScreenRoute).then((_) {
           _lockVisible = false;
-          print("🔓 Lock screen dismissed - user can view stats");
+          _isShowingLock = false;
         }).catchError((error) {
           _lockVisible = false;
+          _isShowingLock = false;
           print("⚠️ Error showing lock screen: $error");
         });
       } else {
@@ -795,14 +958,16 @@ class MonitorService {
           (route) => false, // Clear all previous routes
         ).then((_) {
           _lockVisible = false;
-          print("🔓 Lock screen dismissed");
+          _isShowingLock = false;
         }).catchError((error) {
           _lockVisible = false;
+          _isShowingLock = false;
           print("⚠️ Error showing lock screen: $error");
         });
       }
     } catch (e) {
       _lockVisible = false;
+      _isShowingLock = false;
       print("⚠️ Exception showing lock screen: $e");
     }
   }

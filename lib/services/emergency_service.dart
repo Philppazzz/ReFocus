@@ -2,6 +2,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:refocus_app/services/lock_state_manager.dart';
 import 'package:refocus_app/services/monitor_service.dart';
 import 'package:refocus_app/database_helper.dart';
+import 'package:refocus_app/pages/home_page.dart'; // For AppState
 
 /// Comprehensive Emergency Override Service
 /// Handles emergency unlock with once-per-day limit and proper state management
@@ -94,16 +95,22 @@ class EmergencyService {
         reason: 'Emergency override activated',
       );
       
+      // ✅ CRITICAL: Update AppState immediately to ensure all services see the change
+      AppState().isOverrideEnabled = true;
+      print("✅ AppState.isOverrideEnabled set to TRUE");
+      
       print("✅ Emergency activated:");
       print("   - All locks cleared");
       print("   - Session timer reset");
       print("   - Unlock counter reset");
       print("   - Daily usage preserved: ${currentDailyUsage}h");
       print("   - Tracking stopped");
+      print("   - AppState.isOverrideEnabled = TRUE");
       
       return {
         'success': true,
-        'message': 'Emergency override activated. All restrictions lifted temporarily.',
+        'message': 'Emergency override activated for 24 hours. All restrictions lifted temporarily.',
+        'expires_in_hours': 24,
       };
     } catch (e) {
       print("⚠️ Error activating emergency: $e");
@@ -133,6 +140,10 @@ class EmergencyService {
       // Clear stats cache to force fresh fetch
       MonitorService.clearStatsCache();
       
+      // ✅ CRITICAL: Update AppState immediately to ensure all services see the change
+      AppState().isOverrideEnabled = false;
+      print("✅ AppState.isOverrideEnabled set to FALSE");
+      
       // Wait a moment to ensure state is updated
       await Future.delayed(const Duration(milliseconds: 100));
       
@@ -143,6 +154,7 @@ class EmergencyService {
       print("   - Tracking resumed");
       print("   - Monitoring restarted");
       print("   - Events during emergency skipped");
+      print("   - AppState.isOverrideEnabled = FALSE");
       
     } catch (e) {
       print("⚠️ Error deactivating emergency: $e");
@@ -150,9 +162,45 @@ class EmergencyService {
   }
 
   /// Check if emergency override is currently active
+  /// Automatically deactivates after 24 hours
   static Future<bool> isEmergencyActive() async {
     final prefs = await SharedPreferences.getInstance();
-    return prefs.getBool(KEY_EMERGENCY_OVERRIDE_ENABLED) ?? false;
+    final isEnabled = prefs.getBool(KEY_EMERGENCY_OVERRIDE_ENABLED) ?? false;
+    
+    if (!isEnabled) return false;
+    
+    // Check if emergency override has been active for more than 24 hours
+    final startTime = prefs.getInt('emergency_override_start_time');
+    if (startTime != null) {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final elapsedHours = (now - startTime) / (1000 * 60 * 60);
+      
+      if (elapsedHours >= 24) {
+        print('🚨 Emergency override expired (24 hours limit) - Auto-deactivating');
+        await deactivateEmergency();
+        return false;
+      }
+    }
+    
+    return true;
+  }
+  
+  /// Get remaining time for current emergency override (in hours)
+  /// Returns 0 if not active
+  static Future<double> getRemainingEmergencyHours() async {
+    final prefs = await SharedPreferences.getInstance();
+    final isEnabled = prefs.getBool(KEY_EMERGENCY_OVERRIDE_ENABLED) ?? false;
+    
+    if (!isEnabled) return 0.0;
+    
+    final startTime = prefs.getInt('emergency_override_start_time');
+    if (startTime == null) return 24.0; // Default to full 24 hours if start time not recorded
+    
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final elapsedHours = (now - startTime) / (1000 * 60 * 60);
+    final remaining = 24.0 - elapsedHours;
+    
+    return remaining.clamp(0.0, 24.0);
   }
 
   /// Get time until emergency is available again (in hours)
@@ -174,7 +222,6 @@ class EmergencyService {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(KEY_EMERGENCY_USED_TODAY);
     await prefs.remove(KEY_EMERGENCY_DATE);
-    print("🔄 Emergency usage reset - available again");
   }
 }
 

@@ -27,7 +27,9 @@ class MainActivity : FlutterActivity() {
     private val CHANNEL_PERMISSION = "com.example.usage_stats/permission"
     private val CHANNEL_SOCIAL = "com.example.socialapps/channel"
     private val CHANNEL_MONITOR = "com.example.refocus/monitor"
-    
+    private val CHANNEL_CATEGORIZATION = "com.example.refocus/categorization"
+    private val CHANNEL_APP_NAMES = "com.example.refocus/app_names"
+
     private val OVERLAY_PERMISSION_REQUEST = 1001
     private val LOCK_NOTIFICATION_CHANNEL_ID = "lock_screen_channel"
     private val LOCK_NOTIFICATION_ID = 999
@@ -70,6 +72,25 @@ class MainActivity : FlutterActivity() {
                 } else result.notImplemented()
             }
 
+        // ✅ Categorization channel for app categorization
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL_CATEGORIZATION)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "getAllInstalledApps" -> {
+                        result.success(getAllInstalledAppsWithCategories())
+                    }
+                    "getAppInfo" -> {
+                        val packageName = call.argument<String>("packageName")
+                        if (packageName != null) {
+                            result.success(getAppInfo(packageName))
+                        } else {
+                            result.error("INVALID_ARG", "Package name required", null)
+                        }
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+
         // ✅ Monitor channel for foreground app detection
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL_MONITOR)
             .setMethodCallHandler { call, result ->
@@ -99,6 +120,41 @@ class MainActivity : FlutterActivity() {
                             result.success(null)
                         } else {
                             result.error("INVALID_ARG", "Package name required", null)
+                        }
+                    }
+                    "hasNotificationPermission" -> {
+                        result.success(hasNotificationPermission())
+                    }
+                    "requestNotificationPermission" -> {
+                        requestNotificationPermission()
+                        result.success(null)
+                    }
+                    "openAppSettings" -> {
+                        openAppSettings()
+                        result.success(null)
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+
+        // ✅ App Names channel for fetching real app labels
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL_APP_NAMES)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "getAppLabel" -> {
+                        val packageName = call.argument<String>("packageName")
+                        if (packageName != null) {
+                            result.success(getAppLabel(packageName))
+                        } else {
+                            result.error("INVALID_ARG", "Package name required", null)
+                        }
+                    }
+                    "getAppLabels" -> {
+                        val packageNames = call.argument<List<String>>("packageNames")
+                        if (packageNames != null) {
+                            result.success(getAppLabels(packageNames))
+                        } else {
+                            result.error("INVALID_ARG", "Package names required", null)
                         }
                     }
                     else -> result.notImplemented()
@@ -318,6 +374,49 @@ class MainActivity : FlutterActivity() {
     }
 
     /**
+     * Check if notification permission is granted (Android 13+)
+     */
+    private fun hasNotificationPermission(): Boolean {
+        return if (Build.VERSION.SDK_INT >= 33) {
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+        } else {
+            true // Permission not required on older Android versions
+        }
+    }
+
+    /**
+     * Request notification permission (Android 13+)
+     */
+    private fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= 33) {
+            if (!hasNotificationPermission()) {
+                requestPermissions(
+                    arrayOf(android.Manifest.permission.POST_NOTIFICATIONS),
+                    1002
+                )
+                Log.d("Monitor", "📋 Requesting POST_NOTIFICATIONS permission (Android 13+)")
+            } else {
+                Log.d("Monitor", "✅ POST_NOTIFICATIONS permission already granted")
+            }
+        }
+    }
+
+    /**
+     * Open app settings
+     */
+    private fun openAppSettings() {
+        try {
+            val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+            intent.data = Uri.parse("package:$packageName")
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(intent)
+            Log.d("Monitor", "📋 Opening app settings")
+        } catch (e: Exception) {
+            Log.w("Monitor", "⚠️ Error opening app settings: ${e.message}")
+        }
+    }
+
+    /**
      * Create notification channel for full-screen intents (Android 8.0+)
      */
     private fun createNotificationChannel() {
@@ -526,6 +625,121 @@ class MainActivity : FlutterActivity() {
     }
 
     /**
+     * ✅ Get all installed apps with Play Store verification
+     * Returns list of maps containing: packageName, appName, category, isSystemApp, isFromPlayStore
+     * ✅ CRITICAL: Only includes apps from Play Store (verified) or system apps
+     * ✅ EXCLUDES: Pirated/unverified apps (not from Play Store)
+     */
+    private fun getAllInstalledAppsWithCategories(): List<Map<String, Any>> {
+        try {
+            val pm = packageManager
+            val apps = pm.getInstalledApplications(PackageManager.GET_META_DATA)
+            val playStoreInstaller = "com.android.vending" // Google Play Store package name
+
+            return apps.mapNotNull { appInfo ->
+                try {
+                    val packageName = appInfo.packageName
+                    val appName = pm.getApplicationLabel(appInfo).toString()
+                    val isSystemApp = (appInfo.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0
+                    
+                    // ✅ CRITICAL: Verify if app is from Play Store
+                    val installerPackageName = pm.getInstallerPackageName(packageName)
+                    val isFromPlayStore = installerPackageName == playStoreInstaller
+                    
+                    // ✅ EXCLUDE: Non-Play Store apps (pirated/unverified) - but keep system apps
+                    if (!isFromPlayStore && !isSystemApp) {
+                        // Skip this app - it's not from Play Store and not a system app
+                        return@mapNotNull null
+                    }
+
+                    // Get Play Store category (API 26+)
+                    val category = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        when (appInfo.category) {
+                            android.content.pm.ApplicationInfo.CATEGORY_GAME -> "GAME"
+                            android.content.pm.ApplicationInfo.CATEGORY_AUDIO -> "MUSIC_AND_AUDIO"
+                            android.content.pm.ApplicationInfo.CATEGORY_VIDEO -> "VIDEO_PLAYERS"
+                            android.content.pm.ApplicationInfo.CATEGORY_IMAGE -> "PHOTOGRAPHY"
+                            android.content.pm.ApplicationInfo.CATEGORY_SOCIAL -> "SOCIAL"
+                            android.content.pm.ApplicationInfo.CATEGORY_NEWS -> "NEWS_AND_MAGAZINES"
+                            android.content.pm.ApplicationInfo.CATEGORY_MAPS -> "MAPS_AND_NAVIGATION"
+                            android.content.pm.ApplicationInfo.CATEGORY_PRODUCTIVITY -> "PRODUCTIVITY"
+                            else -> "UNDEFINED"
+                        }
+                    } else {
+                        "UNDEFINED"
+                    }
+
+                    mapOf(
+                        "packageName" to packageName,
+                        "appName" to appName,
+                        "category" to category,
+                        "isSystemApp" to isSystemApp,
+                        "isFromPlayStore" to isFromPlayStore  // ✅ New field
+                    )
+                } catch (e: Exception) {
+                    Log.w("Categorization", "⚠️ Error processing app ${appInfo.packageName}: ${e.message}")
+                    null
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("Categorization", "⚠️ Error getting installed apps: ${e.message}")
+            return emptyList()
+        }
+    }
+
+    /**
+     * ✅ Get info for a specific app package with Play Store verification
+     * Returns map containing: packageName, appName, category, isSystemApp, isFromPlayStore, or null if not found
+     * ✅ CRITICAL: Returns null for non-Play Store apps (unless it's a system app)
+     */
+    private fun getAppInfo(packageName: String): Map<String, Any>? {
+        try {
+            val pm = packageManager
+            val appInfo = pm.getApplicationInfo(packageName, PackageManager.GET_META_DATA)
+            val appName = pm.getApplicationLabel(appInfo).toString()
+            val isSystemApp = (appInfo.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0
+            
+            // ✅ CRITICAL: Verify if app is from Play Store
+            val installerPackageName = pm.getInstallerPackageName(packageName)
+            val playStoreInstaller = "com.android.vending"
+            val isFromPlayStore = installerPackageName == playStoreInstaller
+            
+            // ✅ EXCLUDE: Non-Play Store apps (but keep system apps)
+            if (!isFromPlayStore && !isSystemApp) {
+                return null  // Skip non-Play Store apps
+            }
+
+            // Get Play Store category (API 26+)
+            val category = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                when (appInfo.category) {
+                    android.content.pm.ApplicationInfo.CATEGORY_GAME -> "GAME"
+                    android.content.pm.ApplicationInfo.CATEGORY_AUDIO -> "MUSIC_AND_AUDIO"
+                    android.content.pm.ApplicationInfo.CATEGORY_VIDEO -> "VIDEO_PLAYERS"
+                    android.content.pm.ApplicationInfo.CATEGORY_IMAGE -> "PHOTOGRAPHY"
+                    android.content.pm.ApplicationInfo.CATEGORY_SOCIAL -> "SOCIAL"
+                    android.content.pm.ApplicationInfo.CATEGORY_NEWS -> "NEWS_AND_MAGAZINES"
+                    android.content.pm.ApplicationInfo.CATEGORY_MAPS -> "MAPS_AND_NAVIGATION"
+                    android.content.pm.ApplicationInfo.CATEGORY_PRODUCTIVITY -> "PRODUCTIVITY"
+                    else -> "UNDEFINED"
+                }
+            } else {
+                "UNDEFINED"
+            }
+
+            return mapOf(
+                "packageName" to packageName,
+                "appName" to appName,
+                "category" to category,
+                "isSystemApp" to isSystemApp,
+                "isFromPlayStore" to isFromPlayStore  // ✅ New field
+            )
+        } catch (e: Exception) {
+            Log.e("Categorization", "⚠️ Error getting app info for $packageName: ${e.message}")
+            return null
+        }
+    }
+
+    /**
      * ✅ Request required runtime permissions for different Android versions
      * - Android 13+ (API 33): POST_NOTIFICATIONS
      * - Android 14+ (API 34): USE_FULL_SCREEN_INTENT
@@ -583,7 +797,7 @@ class MainActivity : FlutterActivity() {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        
+
         if (requestCode == OVERLAY_PERMISSION_REQUEST) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 if (Settings.canDrawOverlays(this)) {
@@ -593,5 +807,45 @@ class MainActivity : FlutterActivity() {
                 }
             }
         }
+    }
+
+    /**
+     * ✅ Get real app label (human-readable name) for a package
+     * Returns the app name shown to users, not the package name
+     * Example: com.facebook.katana → "Facebook"
+     */
+    private fun getAppLabel(packageName: String): String? {
+        return try {
+            val pm = packageManager
+            val appInfo = pm.getApplicationInfo(packageName, PackageManager.GET_META_DATA)
+            pm.getApplicationLabel(appInfo).toString()
+        } catch (e: Exception) {
+            Log.w("AppNames", "⚠️ Could not get label for $packageName: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * ✅ Get real app labels for multiple packages (batch operation)
+     * More efficient than calling getAppLabel multiple times
+     * Returns map of packageName → appLabel
+     */
+    private fun getAppLabels(packageNames: List<String>): Map<String, String> {
+        val results = mutableMapOf<String, String>()
+        val pm = packageManager
+
+        for (packageName in packageNames) {
+            try {
+                val appInfo = pm.getApplicationInfo(packageName, PackageManager.GET_META_DATA)
+                val appLabel = pm.getApplicationLabel(appInfo).toString()
+                results[packageName] = appLabel
+            } catch (e: Exception) {
+                Log.w("AppNames", "⚠️ Could not get label for $packageName: ${e.message}")
+                // Don't include in results - Flutter side will use package name as fallback
+            }
+        }
+
+        Log.d("AppNames", "✅ Fetched ${results.size} app labels out of ${packageNames.size} requests")
+        return results
     }
 }

@@ -6,20 +6,26 @@ import 'package:refocus_app/services/lock_state_manager.dart';
 import 'package:refocus_app/services/monitor_service.dart';
 import 'package:refocus_app/pages/home_page.dart';
 import 'package:refocus_app/services/usage_service.dart';
-import 'package:refocus_app/services/selected_apps.dart';
 import 'package:refocus_app/database_helper.dart';
 import 'package:refocus_app/services/emergency_service.dart';
+import 'package:refocus_app/widgets/lock_feedback_dialog.dart';
+import 'package:refocus_app/services/usage_monitoring_service.dart';
+import 'package:refocus_app/services/app_categorization_service.dart';
 
 class LockScreen extends StatefulWidget {
   final String reason;
   final String appName;
   final int cooldownSeconds;
+  final String? mlSource; // ✅ ML source: 'ensemble', 'rule_based', 'safety', etc.
+  final double? mlConfidence; // ✅ ML confidence (0.0-1.0)
 
   const LockScreen({
     super.key,
     required this.reason,
     required this.appName,
     required this.cooldownSeconds,
+    this.mlSource,
+    this.mlConfidence,
   });
 
   @override
@@ -38,6 +44,13 @@ class _LockScreenState extends State<LockScreen> {
     _isDailyLock = widget.reason == 'daily_limit';
     
     print("🔒 LockScreen initialized: reason=${widget.reason}, cooldown=${widget.cooldownSeconds}s, isDaily=$_isDailyLock");
+    
+    // Show feedback dialog after a short delay (when lock screen is visible)
+    Future.delayed(const Duration(seconds: 2), () {
+      if (mounted) {
+        _showFeedbackDialog();
+      }
+    });
     
     // Only create timer for session/unlock locks, NOT for daily locks
     if (!_isDailyLock) {
@@ -58,6 +71,74 @@ class _LockScreenState extends State<LockScreen> {
           _handleExpired();
       }
     });
+    }
+  }
+
+  Future<void> _showFeedbackDialog() async {
+    try {
+      // ✅ CRITICAL: widget.appName might be package name or display name
+      // Get the actual package name for proper feedback logging
+      final packageName = widget.appName; // This is the package name from MonitorService
+      
+      // Get category and usage data for feedback
+      final category = await AppCategorizationService.getCategoryForPackage(packageName);
+      final monitoringService = UsageMonitoringService();
+      final dailyUsage = monitoringService.dailyUsage[category] ?? 0;
+      final sessionUsage = monitoringService.sessionUsage[category] ?? 0;
+      
+      // ✅ Get human-readable app name for display
+      String displayAppName = packageName;
+      try {
+        // Try to get readable name (if AppNameService is available)
+        // For now, use package name as fallback
+        displayAppName = packageName;
+      } catch (e) {
+        print('⚠️ Could not get app display name: $e');
+      }
+      
+      // ✅ CRITICAL: Use ML source/confidence passed from MonitorService (most accurate)
+      // Fallback to parsing reason string if not provided
+      String predictionSource = widget.mlSource ?? 'rule_based';
+      double? modelConfidence = widget.mlConfidence;
+      
+      // ✅ FALLBACK: Extract prediction source from reason if not provided
+      if (predictionSource == 'rule_based' && widget.mlSource == null) {
+        if (widget.reason.contains('Ensemble') || 
+            widget.reason.contains('ensemble') ||
+            widget.reason.contains('ML') || 
+            widget.reason.contains('ml')) {
+          predictionSource = 'ml';
+          // Try to extract confidence if available
+          final confidenceMatch = RegExp(r'(\d+(?:\.\d+)?)%').firstMatch(widget.reason);
+          if (confidenceMatch != null) {
+            modelConfidence = double.parse(confidenceMatch.group(1)!) / 100.0;
+          }
+        } else if (widget.reason.contains('Rule-based') || 
+                   widget.reason.contains('rule_based') ||
+                   widget.reason.contains('Safety')) {
+          predictionSource = 'rule_based';
+        }
+      }
+
+      if (!mounted) return;
+
+      await showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => LockFeedbackDialog(
+          appName: displayAppName,
+          appCategory: category,
+          dailyUsage: dailyUsage,
+          sessionUsage: sessionUsage,
+          lockReason: widget.reason,
+          predictionSource: predictionSource,
+          modelConfidence: modelConfidence,
+        ),
+      );
+    } catch (e, stackTrace) {
+      print('⚠️ Error showing feedback dialog: $e');
+      print('Stack trace: $stackTrace');
+      // ✅ SAFE FALLBACK: Don't crash if feedback dialog fails
     }
   }
 
@@ -98,15 +179,13 @@ class _LockScreenState extends State<LockScreen> {
     } else if (widget.reason == 'unlock_limit') {
       // MOST UNLOCK: Only reset unlock counter
       print("   🔓 Most Unlock violation - resetting UNLOCK COUNTER only");
-      await SelectedAppsManager.loadFromPrefs();
       final stats = await UsageService.getUsageStatsWithEvents(
-        SelectedAppsManager.selectedApps,
         updateSessionTracking: false, // Don't update session while resetting
       );
       final currentUnlocks = (stats['most_unlock_count'] as num?)?.toInt() ?? 0;
       await prefs.setInt('unlock_base_$today', currentUnlocks);
       print("   ✓ Unlock base → $currentUnlocks (unlock counter reset)");
-      
+
       // Also clear the unlock cache (but keep usage and session data)
       await prefs.remove('per_app_unlocks_$today');
       print("   ✓ Unlock cache cleared");
@@ -151,6 +230,57 @@ class _LockScreenState extends State<LockScreen> {
     final mins = (seconds / 60).floor();
     final secs = seconds % 60;
     return '${mins.toString().padLeft(2, '0')}:${secs.toString().padLeft(2, '0')}';
+  }
+
+  /// ✅ ML Status Badge - Shows if lock was ML or rule-based
+  Widget _buildMLStatusBadge() {
+    final source = widget.mlSource ?? 'rule_based';
+    final confidence = widget.mlConfidence;
+    
+    Color badgeColor;
+    IconData badgeIcon;
+    String badgeText;
+    
+    if (source == 'ensemble' || source == 'ml') {
+      badgeColor = Colors.green;
+      badgeIcon = Icons.psychology;
+      badgeText = 'ML Decision';
+      if (confidence != null) {
+        badgeText += ' (${(confidence * 100).toStringAsFixed(0)}%)';
+      }
+    } else if (source == 'safety_override') {
+      badgeColor = Colors.red;
+      badgeIcon = Icons.warning;
+      badgeText = 'Safety Limit';
+    } else {
+      badgeColor = Colors.blue;
+      badgeIcon = Icons.rule;
+      badgeText = 'Rule-Based';
+    }
+    
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: badgeColor.withOpacity(0.2),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: badgeColor.withOpacity(0.5), width: 1),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(badgeIcon, color: badgeColor, size: 16),
+          const SizedBox(width: 6),
+          Text(
+            badgeText,
+            style: GoogleFonts.alice(
+              fontSize: 12,
+              fontWeight: FontWeight.bold,
+              color: badgeColor,
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   // Get violation-specific UI elements
@@ -257,13 +387,18 @@ class _LockScreenState extends State<LockScreen> {
                     const SizedBox(height: 24),
                 Text(
                       ui['title'],
-                      style: GoogleFonts.inter(fontSize: 32, fontWeight: FontWeight.bold, color: Colors.white),
+                      style: GoogleFonts.alice(fontSize: 32, fontWeight: FontWeight.bold, color: Colors.white),
                 ),
                     const SizedBox(height: 8),
                 Text(
                       ui['subtitle'],
-                      style: GoogleFonts.inter(fontSize: 14, color: Colors.white60),
+                      style: GoogleFonts.alice(fontSize: 14, color: Colors.white60),
                   ),
+                  // ✅ ML Status Badge - Shows if lock was ML or rule-based
+                  if (widget.mlSource != null || widget.mlConfidence != null) ...[
+                    const SizedBox(height: 12),
+                    _buildMLStatusBadge(),
+                  ],
                   ],
                 ),
 
@@ -279,7 +414,7 @@ class _LockScreenState extends State<LockScreen> {
                       children: [
                       Text(
                         _isDailyLock ? 'Unlocks Tomorrow' : 'Time Remaining',
-                        style: GoogleFonts.inter(fontSize: 14, color: Colors.white60),
+                        style: GoogleFonts.alice(fontSize: 14, color: Colors.white60),
                         ),
                       const SizedBox(height: 16),
                         Text(
@@ -435,7 +570,7 @@ class _LockScreenState extends State<LockScreen> {
         ),
       ),
       icon: Icon(icon, size: 18),
-      label: Text(label, style: GoogleFonts.inter(fontSize: 14, fontWeight: FontWeight.bold)),
+      label: Text(label, style: GoogleFonts.alice(fontSize: 14, fontWeight: FontWeight.bold)),
     );
   }
 }
@@ -613,7 +748,7 @@ class _EmergencyUnlockButtonState extends State<_EmergencyUnlockButton> {
           children: [
             Icon(Icons.warning_amber_rounded, color: _isLongPressing ? Colors.orange : Colors.red, size: 20),
             const SizedBox(width: 8),
-            Text(_isLongPressing ? 'Releasing...' : 'Hold for Emergency', style: GoogleFonts.inter(fontSize: 14, fontWeight: FontWeight.bold, color: _isLongPressing ? Colors.orange : Colors.red)),
+            Text(_isLongPressing ? 'Releasing...' : 'Hold for Emergency', style: GoogleFonts.alice(fontSize: 14, fontWeight: FontWeight.bold, color: _isLongPressing ? Colors.orange : Colors.red)),
           ],
         ),
       ),

@@ -1,12 +1,12 @@
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
-import 'package:refocus_app/pages/app_picker_page.dart';
 import 'package:refocus_app/pages/signup.dart';
 import 'package:refocus_app/database_helper.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:refocus_app/pages/home_page.dart';
 import 'package:refocus_app/pages/forgot_password_page.dart';
+import 'package:refocus_app/services/auth_service.dart';
 
 class IntroPage extends StatefulWidget {
   const IntroPage({super.key});
@@ -35,7 +35,7 @@ class _IntroPageState extends State<IntroPage> {
     final isLoggedIn = prefs.getBool('isLoggedIn') ?? false;
 
     if (isLoggedIn) {
-      // User is already logged in, navigate to AppPickerPage
+      // User is already logged in, navigate to HomePage
       Navigator.pushReplacement(
         context,
         MaterialPageRoute(builder: (context) => const  HomePage()),
@@ -72,6 +72,16 @@ class _IntroPageState extends State<IntroPage> {
       return;
     }
 
+    // ✅ Check for login lockout (rate limiting)
+    final lockoutStatus = await AuthService.checkLoginLockout(email);
+    if (lockoutStatus['isLocked'] == true) {
+      final remainingMinutes = lockoutStatus['remainingMinutes'] as int;
+      setState(() {
+        passwordError = "Too many failed attempts. Try again in $remainingMinutes minute${remainingMinutes > 1 ? 's' : ''}";
+      });
+      return;
+    }
+
     setState(() => isLoading = true);
 
     final db = DatabaseHelper.instance;
@@ -89,19 +99,41 @@ class _IntroPageState extends State<IntroPage> {
     setState(() => isLoading = false);
 
     if (user == null) {
-      setState(() => passwordError = "Incorrect password");
+      // ❌ Failed login: Record attempt
+      await AuthService.recordFailedLogin(email);
+      final attempts = lockoutStatus['attempts'] as int;
+      final remaining = AuthService.MAX_LOGIN_ATTEMPTS - attempts - 1;
+      
+      if (remaining > 0) {
+        setState(() => passwordError = "Incorrect password ($remaining attempt${remaining > 1 ? 's' : ''} remaining)");
+      } else {
+        setState(() => passwordError = "Incorrect password. Account will be locked after one more failed attempt");
+      }
       return;
     }
 
-    // ✅ Successful login: Save login status
+    // ✅ Successful login: Clear attempts and save login status
+    await AuthService.clearLoginAttempts(email);
+    print("🔐 LOGIN SUCCESS - Saving preferences...");
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('isLoggedIn', true); // save login status
     await prefs.setString('userEmail', email); // optional: save email
+    print("✅ Preferences saved");
+
+    print("🚀 Navigating to HomePage...");
+    if (!mounted) {
+      print("❌ Widget not mounted!");
+      return;
+    }
 
     Navigator.pushReplacement(
       context,
-      MaterialPageRoute(builder: (context) => const AppPickerPage()),
+      MaterialPageRoute(builder: (context) {
+        print("📱 Building HomePage...");
+        return const HomePage();
+      }),
     );
+    print("✅ Navigation called");
   }
 
   @override
@@ -263,7 +295,7 @@ class _IntroPageState extends State<IntroPage> {
                                   },
                                   child: Text(
                                     "Forgot Password?",
-                                    style: GoogleFonts.poppins(
+                                    style: GoogleFonts.alice(
                                       color: Colors.black87,
                                       fontSize: 14,
                                       fontWeight: FontWeight.w500,
@@ -311,7 +343,7 @@ class _IntroPageState extends State<IntroPage> {
                           SizedBox(height: screenHeight * 0.02),
                           RichText(
                             text: TextSpan(
-                              style: GoogleFonts.poppins(
+                              style: GoogleFonts.alice(
                                 color: Colors.black54,
                                 fontSize: 14,
                               ),

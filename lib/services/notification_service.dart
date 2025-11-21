@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:refocus_app/services/proactive_feedback_service.dart';
+import 'package:refocus_app/services/feedback_logger.dart';
 
 class NotificationService {
   static final FlutterLocalNotificationsPlugin _notifications =
@@ -13,6 +15,8 @@ class NotificationService {
   static const int _unlockWarningId = 3;
   static const int _limitReachedId = 4;
   static const int _cooldownId = 5;
+  static const int _proactiveFeedbackId = 6;
+  static const int _lockFeedbackId = 7; // ✅ Lock feedback notification
 
   /// Initialize notification service
   static Future<void> initialize() async {
@@ -47,25 +51,169 @@ class NotificationService {
 
   /// Create notification channels for Android (required for Android 8.0+)
   static Future<void> _createNotificationChannels() async {
-    const androidChannel = AndroidNotificationChannel(
+    final androidPlugin = _notifications
+        .resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin>();
+
+    if (androidPlugin == null) return;
+
+    // Channel 1: Warnings (high priority)
+    const warningsChannel = AndroidNotificationChannel(
       'refocus_warnings',
-      'ReFocus Warnings',
-      description: 'Notifications for usage limit warnings',
+      'Usage Warnings',
+      description: 'Notifications for usage limit warnings and predictions',
       importance: Importance.high,
       playSound: true,
       enableVibration: true,
     );
 
-    await _notifications
-        .resolvePlatformSpecificImplementation<
-            AndroidFlutterLocalNotificationsPlugin>()
-        ?.createNotificationChannel(androidChannel);
+    // Channel 2: Locks (max priority)
+    const locksChannel = AndroidNotificationChannel(
+      'refocus_locks',
+      'Lock Notifications',
+      description: 'Notifications when apps are locked or unlocked',
+      importance: Importance.max,
+      playSound: true,
+      enableVibration: true,
+    );
+
+    // Channel 3: Motivational (low priority)
+    const motivationalChannel = AndroidNotificationChannel(
+      'refocus_motivational',
+      'Motivational Messages',
+      description: 'Motivational and achievement notifications',
+      importance: Importance.low,
+      playSound: false,
+      enableVibration: false,
+    );
+
+    // Channel 4: Feedback (medium priority)
+    const feedbackChannel = AndroidNotificationChannel(
+      'refocus_feedback',
+      'Feedback Requests',
+      description: 'Notifications for AI learning feedback',
+      importance: Importance.defaultImportance,
+      playSound: false,
+      enableVibration: false,
+    );
+
+    // Create all channels
+    await androidPlugin.createNotificationChannel(warningsChannel);
+    await androidPlugin.createNotificationChannel(locksChannel);
+    await androidPlugin.createNotificationChannel(motivationalChannel);
+    await androidPlugin.createNotificationChannel(feedbackChannel);
+
+    print("✅ Notification channels created");
   }
 
-  /// Handle notification tap
-  static void _onNotificationTapped(NotificationResponse response) {
-    print("📱 Notification tapped: ${response.id}");
-    // Could navigate to lock screen or home page here if needed
+  /// Handle notification tap and actions
+  static void _onNotificationTapped(NotificationResponse response) async {
+    print("📱 Notification tapped: ${response.id}, action: ${response.actionId}");
+    
+    // Handle proactive feedback actions
+    if (response.id == _proactiveFeedbackId) {
+      final actionId = response.actionId;
+      
+      if (actionId == 'feedback_yes' || actionId == 'feedback_no') {
+        final wouldBeHelpful = actionId == 'feedback_yes';
+        
+        // Parse payload or get from SharedPreferences
+        String? appName;
+        String? category;
+        int? sessionUsage;
+        int? dailyUsage;
+        
+        if (response.payload != null && response.payload!.contains('|')) {
+          final parts = response.payload!.split('|');
+          if (parts.length >= 5) {
+            appName = parts[1];
+            category = parts[2];
+            sessionUsage = int.tryParse(parts[3]);
+            dailyUsage = int.tryParse(parts[4]);
+          }
+        }
+        
+        // Fallback to SharedPreferences if payload parsing failed
+        if (appName == null || category == null || sessionUsage == null || dailyUsage == null) {
+          final prefs = await SharedPreferences.getInstance();
+          appName = prefs.getString('pending_feedback_app');
+          category = prefs.getString('pending_feedback_category');
+          sessionUsage = prefs.getInt('pending_feedback_session');
+          dailyUsage = prefs.getInt('pending_feedback_daily');
+        }
+        
+        if (appName != null && category != null && sessionUsage != null && dailyUsage != null) {
+          await handleProactiveFeedbackAction(
+            wouldBeHelpful: wouldBeHelpful,
+            appName: appName,
+            category: category,
+            sessionUsageMinutes: sessionUsage,
+            dailyUsageMinutes: dailyUsage,
+          );
+        } else {
+          print("⚠️ Could not parse feedback data from notification");
+        }
+      }
+    }
+    
+    // ✅ Handle lock feedback actions (when app is locked)
+    if (response.id == _lockFeedbackId) {
+      final actionId = response.actionId;
+      
+      if (actionId == 'lock_feedback_yes' || actionId == 'lock_feedback_no') {
+        final wasHelpful = actionId == 'lock_feedback_yes';
+        
+        // Parse payload or get from SharedPreferences
+        String? appName;
+        String? category;
+        String? lockReason;
+        String? predictionSource;
+        int? sessionUsage;
+        int? dailyUsage;
+        double? modelConfidence;
+        
+        if (response.payload != null && response.payload!.contains('|')) {
+          final parts = response.payload!.split('|');
+          if (parts.length >= 8) {
+            appName = parts[1];
+            category = parts[2];
+            sessionUsage = int.tryParse(parts[3]);
+            dailyUsage = int.tryParse(parts[4]);
+            lockReason = parts[5];
+            predictionSource = parts[6];
+            modelConfidence = double.tryParse(parts[7]);
+          }
+        }
+        
+        // Fallback to SharedPreferences if payload parsing failed
+        if (appName == null || category == null || sessionUsage == null || dailyUsage == null) {
+          final prefs = await SharedPreferences.getInstance();
+          appName = prefs.getString('pending_lock_feedback_app');
+          category = prefs.getString('pending_lock_feedback_category');
+          sessionUsage = prefs.getInt('pending_lock_feedback_session');
+          dailyUsage = prefs.getInt('pending_lock_feedback_daily');
+          lockReason = prefs.getString('pending_lock_feedback_reason');
+          predictionSource = prefs.getString('pending_lock_feedback_source');
+          final confidenceStr = prefs.getString('pending_lock_feedback_confidence');
+          modelConfidence = confidenceStr != null ? double.tryParse(confidenceStr) : null;
+        }
+        
+        if (appName != null && category != null && sessionUsage != null && dailyUsage != null) {
+          await handleLockFeedbackAction(
+            wasHelpful: wasHelpful,
+            appName: appName,
+            category: category,
+            sessionUsageMinutes: sessionUsage,
+            dailyUsageMinutes: dailyUsage,
+            lockReason: lockReason ?? 'App locked',
+            predictionSource: predictionSource ?? 'rule_based',
+            modelConfidence: modelConfidence,
+          );
+        } else {
+          print("⚠️ Could not parse lock feedback data from notification");
+        }
+      }
+    }
   }
 
   /// Request notification permission
@@ -476,16 +624,13 @@ class NotificationService {
   }
 
   /// Check and send warnings based on thresholds with multiple stages
+  /// Unlock count is tracked for stats only - no longer triggers warnings
   static Future<void> checkAndSendWarnings({
     required double dailyHours,
     required double sessionMinutes,
-    required int unlockCount,
     required double dailyLimit,
     required double sessionLimit,
-    required int unlockLimit,
     String? currentAppName,
-    String? mostUnlockedAppName,
-    int? remainingUnlocks,
   }) async {
     final prefs = await SharedPreferences.getInstance();
     final today = DateTime.now().toIso8601String().substring(0, 10);
@@ -515,25 +660,6 @@ class NotificationService {
             sessionLimit,
             threshold,
             currentAppName: currentAppName,
-          );
-          await prefs.setBool(warningKey, true);
-          break; // Only show one warning at a time
-        }
-      }
-    }
-
-    // Check unlock limit warnings at multiple stages
-    for (var threshold in warningThresholds) {
-      final thresholdCount = (unlockLimit * threshold).round();
-      if (unlockCount >= thresholdCount) {
-        final warningKey = 'unlock_warning_${(threshold * 100).toInt()}_$today';
-        if (!(prefs.getBool(warningKey) ?? false)) {
-          await _showUnlockWarningAtStage(
-            unlockCount,
-            unlockLimit,
-            threshold,
-            mostUnlockedAppName: mostUnlockedAppName,
-            remainingUnlocks: remainingUnlocks,
           );
           await prefs.setBool(warningKey, true);
           break; // Only show one warning at a time
@@ -679,63 +805,472 @@ class NotificationService {
     print("📢 Session limit warning (${(threshold * 100).toInt()}%) sent: ${currentMins}min / ${limitMins}min");
   }
 
-  /// Show unlock warning at specific stage with realistic messages
-  static Future<void> _showUnlockWarningAtStage(
-      int currentUnlocks, int limitUnlocks, double threshold,
-      {String? mostUnlockedAppName, int? remainingUnlocks}) async {
+  // ===== CATEGORY-BASED LOCK NOTIFICATIONS =====
+
+  /// Show session lock notification
+  static Future<void> showSessionLockNotification(int durationMinutes, int violationNumber, String category) async {
     if (!_initialized) await initialize();
 
-    int remaining = limitUnlocks - currentUnlocks;
-    if (remainingUnlocks != null) {
-      remaining = remainingUnlocks;
-    }
-    if (remaining < 0) remaining = 0;
-    final percentageUsed = ((currentUnlocks / limitUnlocks) * 100).toInt();
-
-    String title;
-    String message;
-    final appLabel = (mostUnlockedAppName != null && mostUnlockedAppName.trim().isNotEmpty)
-        ? mostUnlockedAppName.trim()
-        : 'your top app';
-
-    if (threshold == 0.5) {
-      // 50% - Friendly reminder
-      title = '📱 App Opening Tracker';
-      message = '$appLabel has been opened ${currentUnlocks} times today.\n'
-          'You have ${remaining} unlocks left. Try staying focused!';
-    } else if (threshold == 0.75) {
-      // 75% - More urgent
-      title = '⚠️ App Switching Alert';
-      message = '$appLabel keeps pulling you back (${currentUnlocks}/${limitUnlocks}, ${percentageUsed}%).\n'
-          '⏰ Only ${remaining} unlocks remaining today!';
-    } else {
-      // 90% - Final warning
-      title = '🚨 Almost Out of Opens!';
-      message = '🚨 $appLabel is at ${percentageUsed}% of the unlock limit!\n'
-          'Just ${remaining} more unlocks before everything locks.\n'
-          'Make them count!';
-    }
+    final title = '🔒 Apps Locked';
+    final message = 'Combined session limit exceeded (used $category).\n'
+        'Locked for $durationMinutes minutes (Violation #$violationNumber).\n'
+        'All monitored apps are now blocked.';
 
     final androidDetails = AndroidNotificationDetails(
-      'refocus_warnings',
-      'Most Unlock Warnings',
-      channelDescription: 'Notifications for app unlock limit warnings',
-      importance: threshold >= 0.9 ? Importance.max : Importance.high,
-      priority: threshold >= 0.9 ? Priority.max : Priority.high,
+      'refocus_locks',
+      'Lock Notifications',
+      channelDescription: 'Notifications when apps are locked',
+      importance: Importance.max,
+      priority: Priority.max,
+      ongoing: true, // Persistent notification
       showWhen: true,
       icon: '@mipmap/ic_launcher',
-      color: const Color(0xFFEF4444),
+      color: const Color(0xFFEF4444), // Red color
+      playSound: true,
+      enableVibration: true,
     );
 
     final notificationDetails = NotificationDetails(android: androidDetails);
 
     await _notifications.show(
-      _unlockWarningId,
+      _cooldownId,
       title,
       message,
       notificationDetails,
     );
 
-    print("📢 Unlock limit warning (${(threshold * 100).toInt()}%) sent: $currentUnlocks / $limitUnlocks");
+    print("📢 Session lock notification sent: $durationMinutes mins, violation #$violationNumber");
+  }
+
+  /// Show daily lock notification
+  static Future<void> showDailyLockNotification(String category) async {
+    if (!_initialized) await initialize();
+
+    final title = '🔒 Daily Limit Reached';
+    final message = 'Combined daily limit exceeded (used $category).\n'
+        'All monitored apps locked until midnight.\n'
+        'Usage resets at 12:00 AM.';
+
+    final androidDetails = AndroidNotificationDetails(
+      'refocus_locks',
+      'Lock Notifications',
+      channelDescription: 'Notifications when apps are locked',
+      importance: Importance.max,
+      priority: Priority.max,
+      ongoing: true, // Persistent notification
+      showWhen: true,
+      icon: '@mipmap/ic_launcher',
+      color: const Color(0xFFEF4444), // Red color
+      playSound: true,
+      enableVibration: true,
+    );
+
+    final notificationDetails = NotificationDetails(android: androidDetails);
+
+    await _notifications.show(
+      _cooldownId,
+      title,
+      message,
+      notificationDetails,
+    );
+
+    print("📢 Daily lock notification sent for $category");
+  }
+
+  /// Show unlock notification
+  static Future<void> showUnlockNotification() async {
+    if (!_initialized) await initialize();
+
+    final title = '✅ Apps Unlocked';
+    final message = 'Lock timer ended.\n'
+        'All monitored apps are now accessible again.';
+
+    final androidDetails = AndroidNotificationDetails(
+      'refocus_locks',
+      'Lock Notifications',
+      channelDescription: 'Notifications when apps are unlocked',
+      importance: Importance.high,
+      priority: Priority.high,
+      showWhen: true,
+      icon: '@mipmap/ic_launcher',
+      color: const Color(0xFF10B981), // Green color
+      playSound: true,
+    );
+
+    final notificationDetails = NotificationDetails(android: androidDetails);
+
+    // Cancel ongoing lock notification first
+    await _notifications.cancel(_cooldownId);
+
+    await _notifications.show(
+      _cooldownId + 1,
+      title,
+      message,
+      notificationDetails,
+    );
+
+    print("📢 Unlock notification sent");
+  }
+
+  /// Show midnight reset notification
+  static Future<void> showMidnightResetNotification(Map<String, int> yesterdayUsage) async {
+    if (!_initialized) await initialize();
+
+    final social = yesterdayUsage['Social'] ?? 0;
+    final games = yesterdayUsage['Games'] ?? 0;
+    final entertainment = yesterdayUsage['Entertainment'] ?? 0;
+
+    final title = '🌙 New Day Started';
+    final message = 'All limits have been reset!\n\n'
+        'Yesterday\'s usage:\n'
+        '  Social: $social mins\n'
+        '  Games: $games mins\n'
+        '  Entertainment: $entertainment mins\n\n'
+        'Have a productive day!';
+
+    final androidDetails = AndroidNotificationDetails(
+      'refocus_locks',
+      'Daily Reset',
+      channelDescription: 'Notifications for daily resets',
+      importance: Importance.high,
+      priority: Priority.high,
+      showWhen: true,
+      icon: '@mipmap/ic_launcher',
+      color: const Color(0xFF6366F1), // Purple color
+      playSound: true,
+    );
+
+    final notificationDetails = NotificationDetails(android: androidDetails);
+
+    await _notifications.show(
+      _cooldownId + 2,
+      title,
+      message,
+      notificationDetails,
+    );
+
+    print("📢 Midnight reset notification sent");
+  }
+
+  /// Show proactive feedback notification (learning mode)
+  /// Asks "Would a break be helpful now?" with quick action buttons
+  static Future<void> showProactiveFeedbackNotification({
+    required String appName,
+    required String category,
+    required int sessionUsageMinutes,
+    required int dailyUsageMinutes,
+    required int usageLevel,
+    String? customMessage,
+  }) async {
+    if (!_initialized) await initialize();
+
+    final title = '🤔 Quick Question';
+    final message = customMessage ?? 
+        'You\'ve used $appName for $usageLevel minutes.\n'
+        'Would a break be helpful now?';
+
+    // Create action buttons for quick feedback
+    final androidActions = [
+      const AndroidNotificationAction(
+        'feedback_yes',
+        'Yes, helpful',
+        titleColor: Color(0xFF10B981), // Green
+      ),
+      const AndroidNotificationAction(
+        'feedback_no',
+        'No, I\'m fine',
+        titleColor: Color(0xFF6366F1), // Blue
+      ),
+    ];
+
+    final androidDetails = AndroidNotificationDetails(
+      'refocus_feedback',
+      'Feedback Requests',
+      channelDescription: 'Notifications for AI learning feedback',
+      importance: Importance.defaultImportance,
+      priority: Priority.defaultPriority,
+      showWhen: true,
+      icon: '@mipmap/ic_launcher',
+      color: const Color(0xFF6366F1), // Purple
+      playSound: false,
+      enableVibration: false,
+      actions: androidActions,
+      autoCancel: true,
+      category: AndroidNotificationCategory.message,
+    );
+
+    final notificationDetails = NotificationDetails(android: androidDetails);
+
+    // Store feedback data for action handler
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('pending_feedback_app', appName);
+    await prefs.setString('pending_feedback_category', category);
+    await prefs.setInt('pending_feedback_session', sessionUsageMinutes);
+    await prefs.setInt('pending_feedback_daily', dailyUsageMinutes);
+
+    try {
+      await _notifications.show(
+        _proactiveFeedbackId,
+        title,
+        message,
+        notificationDetails,
+        payload: 'proactive_feedback|$appName|$category|$sessionUsageMinutes|$dailyUsageMinutes',
+      );
+
+      print("✅ NOTIFICATION SENT: Proactive feedback for $appName ($usageLevel min)");
+      print("   Category: $category");
+      print("   Daily: $dailyUsageMinutes min, Session: $sessionUsageMinutes min");
+      print("   ✅ This notification will appear even if user is in another app");
+    } catch (e) {
+      print("❌ ERROR: Failed to show proactive feedback notification: $e");
+      print("   This will prevent feedback collection from other apps");
+      rethrow; // Re-throw to let caller know it failed
+    }
+  }
+
+  /// ✅ Show lock feedback notification (works from any app)
+  /// This ensures feedback is collected even when user is outside ReFocus app
+  static Future<void> showLockFeedbackNotification({
+    required String appName,
+    required String category,
+    required int sessionUsageMinutes,
+    required int dailyUsageMinutes,
+    required String lockReason,
+    String predictionSource = 'rule_based',
+    double? modelConfidence,
+  }) async {
+    if (!_initialized) await initialize();
+
+    final title = '🔒 App Locked';
+    final message = '$appName was locked.\nWas this lock helpful?';
+
+    // Create action buttons for quick feedback
+    final androidActions = [
+      const AndroidNotificationAction(
+        'lock_feedback_yes',
+        'Yes, helpful',
+        titleColor: Color(0xFF10B981), // Green
+      ),
+      const AndroidNotificationAction(
+        'lock_feedback_no',
+        'No, not helpful',
+        titleColor: Color(0xFFEF4444), // Red
+      ),
+    ];
+
+    final androidDetails = AndroidNotificationDetails(
+      'refocus_feedback',
+      'Feedback Requests',
+      channelDescription: 'Notifications for AI learning feedback',
+      importance: Importance.high, // Higher priority for lock feedback
+      priority: Priority.high,
+      showWhen: true,
+      icon: '@mipmap/ic_launcher',
+      color: const Color(0xFFEF4444), // Red for lock
+      playSound: true, // Sound for lock feedback
+      enableVibration: true, // Vibration for lock feedback
+      actions: androidActions,
+      autoCancel: false, // Don't auto-cancel - user should respond
+      category: AndroidNotificationCategory.message,
+    );
+
+    final notificationDetails = NotificationDetails(android: androidDetails);
+
+    // Store feedback data for action handler
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('pending_lock_feedback_app', appName);
+    await prefs.setString('pending_lock_feedback_category', category);
+    await prefs.setInt('pending_lock_feedback_session', sessionUsageMinutes);
+    await prefs.setInt('pending_lock_feedback_daily', dailyUsageMinutes);
+    await prefs.setString('pending_lock_feedback_reason', lockReason);
+    await prefs.setString('pending_lock_feedback_source', predictionSource);
+    if (modelConfidence != null) {
+      await prefs.setString('pending_lock_feedback_confidence', modelConfidence.toString());
+    } else {
+      await prefs.remove('pending_lock_feedback_confidence');
+    }
+    await prefs.setBool('has_pending_lock_feedback', true); // Flag for app resume check
+
+    // Create payload
+    final payload = 'lock_feedback|$appName|$category|$sessionUsageMinutes|$dailyUsageMinutes|$lockReason|$predictionSource|${modelConfidence ?? ''}';
+
+    await _notifications.show(
+      _lockFeedbackId,
+      title,
+      message,
+      notificationDetails,
+      payload: payload,
+    );
+
+    print("📢 Lock feedback notification sent for $appName (Category: $category)");
+  }
+
+  /// ✅ Handle lock feedback notification action
+  /// Called when user taps "Yes, helpful" or "No, not helpful" on lock notification
+  static Future<void> handleLockFeedbackAction({
+    required bool wasHelpful,
+    required String appName,
+    required String category,
+    required int sessionUsageMinutes,
+    required int dailyUsageMinutes,
+    required String lockReason,
+    String predictionSource = 'rule_based',
+    double? modelConfidence,
+  }) async {
+    try {
+      // Log feedback using FeedbackLogger
+      await FeedbackLogger.logLockFeedback(
+        appName: appName,
+        appCategory: category,
+        dailyUsageMinutes: dailyUsageMinutes,
+        sessionUsageMinutes: sessionUsageMinutes,
+        wasHelpful: wasHelpful,
+        lockReason: lockReason,
+        predictionSource: predictionSource,
+        modelConfidence: modelConfidence,
+      );
+
+      // Clear pending feedback flag
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove('pending_lock_feedback_app');
+      await prefs.remove('pending_lock_feedback_category');
+      await prefs.remove('pending_lock_feedback_session');
+      await prefs.remove('pending_lock_feedback_daily');
+      await prefs.remove('pending_lock_feedback_reason');
+      await prefs.remove('pending_lock_feedback_source');
+      await prefs.remove('pending_lock_feedback_confidence');
+      await prefs.setBool('has_pending_lock_feedback', false);
+
+      // Cancel notification
+      await _notifications.cancel(_lockFeedbackId);
+
+      print("✅ Lock feedback logged: ${wasHelpful ? "Helpful" : "Not helpful"} | Category: $category | Source: $predictionSource");
+    } catch (e, stackTrace) {
+      print('❌ Error handling lock feedback action: $e');
+      print('Stack trace: $stackTrace');
+    }
+  }
+
+  /// Handle proactive feedback notification action
+  /// Called when user taps "Yes, helpful" or "No, I'm fine"
+  static Future<void> handleProactiveFeedbackAction({
+    required bool wouldBeHelpful,
+    required String appName,
+    required String category,
+    required int sessionUsageMinutes,
+    required int dailyUsageMinutes,
+  }) async {
+    // Log the feedback
+    await ProactiveFeedbackService.logProactiveFeedback(
+      appName: appName,
+      category: category,
+      sessionUsageMinutes: sessionUsageMinutes,
+      dailyUsageMinutes: dailyUsageMinutes,
+      wouldBeHelpful: wouldBeHelpful,
+    );
+
+    // Clear pending feedback data
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('pending_feedback_app');
+    await prefs.remove('pending_feedback_category');
+    await prefs.remove('pending_feedback_session');
+    await prefs.remove('pending_feedback_daily');
+
+    print("✅ Proactive feedback logged: ${wouldBeHelpful ? "Helpful" : "Not helpful"}");
+  }
+
+  /// Show predictive risk warning
+  static Future<void> showPeakRiskWarning(String category, int currentUsage) async {
+    if (!_initialized) await initialize();
+
+    final title = '🔮 High Overuse Risk';
+    final message = 'AI detected high overuse risk for $category.\n'
+        'Current usage: $currentUsage mins.\n'
+        'You usually exceed limits around this time.\n'
+        'Consider taking a break now!';
+
+    final androidDetails = AndroidNotificationDetails(
+      'refocus_warnings',
+      'Predictive Warnings',
+      channelDescription: 'AI-powered usage predictions',
+      importance: Importance.high,
+      priority: Priority.high,
+      showWhen: true,
+      icon: '@mipmap/ic_launcher',
+      color: const Color(0xFF8B5CF6), // Purple color
+    );
+
+    final notificationDetails = NotificationDetails(android: androidDetails);
+
+    await _notifications.show(
+      _dailyWarningId + 10,
+      title,
+      message,
+      notificationDetails,
+    );
+
+    print("📢 Peak risk warning sent for $category");
+  }
+
+  /// Show motivational streak notification
+  static Future<void> showStreakNotification(int days) async {
+    if (!_initialized) await initialize();
+
+    final title = '🔥 Streak Milestone!';
+    final message = '$days-day streak with no violations!\n'
+        'Keep up the excellent work!';
+
+    final androidDetails = AndroidNotificationDetails(
+      'refocus_motivational',
+      'Motivational Messages',
+      channelDescription: 'Motivational notifications',
+      importance: Importance.low,
+      priority: Priority.low,
+      showWhen: true,
+      icon: '@mipmap/ic_launcher',
+      color: const Color(0xFF10B981), // Green color
+    );
+
+    final notificationDetails = NotificationDetails(android: androidDetails);
+
+    await _notifications.show(
+      _dailyWarningId + 20,
+      title,
+      message,
+      notificationDetails,
+    );
+
+    print("📢 Streak notification sent: $days days");
+  }
+
+  /// Show goal achieved notification
+  static Future<void> showDailyGoalAchieved() async {
+    if (!_initialized) await initialize();
+
+    final title = '🎯 Goal Achieved!';
+    final message = 'You stayed under your limits today!\n'
+        'Well done!';
+
+    final androidDetails = AndroidNotificationDetails(
+      'refocus_motivational',
+      'Motivational Messages',
+      channelDescription: 'Motivational notifications',
+      importance: Importance.low,
+      priority: Priority.low,
+      showWhen: true,
+      icon: '@mipmap/ic_launcher',
+      color: const Color(0xFF10B981), // Green color
+    );
+
+    final notificationDetails = NotificationDetails(android: androidDetails);
+
+    await _notifications.show(
+      _dailyWarningId + 21,
+      title,
+      message,
+      notificationDetails,
+    );
+
+    print("📢 Daily goal achieved notification sent");
   }
 }

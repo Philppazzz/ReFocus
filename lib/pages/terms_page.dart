@@ -24,7 +24,7 @@ class TermsPage extends StatelessWidget {
             flexibleSpace: FlexibleSpaceBar(
               title: Text(
                 'Terms & Conditions',
-                style: GoogleFonts.inter(
+                style: GoogleFonts.alice(
                   fontSize: 22,
                   fontWeight: FontWeight.bold,
                   color: Colors.black87,
@@ -80,7 +80,7 @@ class TermsPage extends StatelessWidget {
                             children: [
                               Text(
                                 'Last Updated',
-                                style: GoogleFonts.inter(
+                                style: GoogleFonts.alice(
                                   fontSize: 12,
                                   color: Colors.white.withOpacity(0.9),
                                   fontWeight: FontWeight.w500,
@@ -89,7 +89,7 @@ class TermsPage extends StatelessWidget {
                               const SizedBox(height: 4),
                               Text(
                                 '${DateTime.now().year}-${DateTime.now().month.toString().padLeft(2, '0')}-${DateTime.now().day.toString().padLeft(2, '0')}',
-                                style: GoogleFonts.inter(
+                                style: GoogleFonts.alice(
                                   fontSize: 16,
                                   color: Colors.white,
                                   fontWeight: FontWeight.bold,
@@ -254,7 +254,7 @@ class TermsPage extends StatelessWidget {
                         Expanded(
                           child: Text(
                             'By using ReFocus, you acknowledge that you have read, understood, and agree to be bound by these Terms & Conditions.',
-                            style: GoogleFonts.inter(
+                            style: GoogleFonts.alice(
                               fontSize: 14,
                               height: 1.6,
                               color: Colors.black87,
@@ -330,7 +330,7 @@ class TermsPage extends StatelessWidget {
                   child: Center(
                     child: Text(
                       number,
-                      style: GoogleFonts.inter(
+                      style: GoogleFonts.alice(
                         fontSize: 14,
                         fontWeight: FontWeight.bold,
                         color: Colors.white,
@@ -348,7 +348,7 @@ class TermsPage extends StatelessWidget {
                 Expanded(
                   child: Text(
                     title,
-                    style: GoogleFonts.inter(
+                    style: GoogleFonts.alice(
                       fontSize: 18,
                       fontWeight: FontWeight.bold,
                       color: Colors.black87,
@@ -364,7 +364,7 @@ class TermsPage extends StatelessWidget {
             padding: const EdgeInsets.all(20),
             child: Text(
               content,
-              style: GoogleFonts.inter(
+              style: GoogleFonts.alice(
                 fontSize: 14,
                 height: 1.8,
                 color: Colors.black87,

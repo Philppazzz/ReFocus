@@ -34,9 +34,36 @@ class _SignupPageState extends State<SignupPage> {
 }
 
 bool _isValidName(String name) {
-  return RegExp(
-    r"^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+([A-Z]\.)?\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)$"
-  ).hasMatch(name);
+  // Accept names with or without middle initial
+  // Examples: "John Doe", "John A. Doe", "John Michael Doe", "Mary Jane Smith"
+  // Pattern: First name(s) + optional middle initial/name + last name(s)
+  // All words must start with capital letter
+  final trimmed = name.trim();
+  final words = trimmed.split(RegExp(r'\s+'));
+  
+  // Must have at least 2 words (first name + last name)
+  if (words.length < 2) {
+    return false;
+  }
+  
+  // Check each word starts with capital letter
+  for (final word in words) {
+    if (word.isEmpty) continue;
+    // Allow middle initial like "A." or full middle name
+    if (word.length == 2 && word.endsWith('.')) {
+      // Middle initial like "A."
+      if (!RegExp(r'^[A-Z]\.$').hasMatch(word)) {
+        return false;
+      }
+    } else {
+      // Regular name word (must start with capital)
+      if (!RegExp(r'^[A-Z][a-z]+$').hasMatch(word)) {
+        return false;
+      }
+    }
+  }
+  
+  return true;
 }
 
 
@@ -136,7 +163,7 @@ bool _isValidName(String name) {
                 TextFormField(
                   controller: fullNameController,
                   decoration: InputDecoration(
-                    hintText: "Full name",
+                    hintText: "First name and last name",
                     prefixIcon: const Icon(Icons.person_outline),
                     filled: true,
                     fillColor: Colors.white,
@@ -151,8 +178,11 @@ bool _isValidName(String name) {
                     if (value == null || value.trim().isEmpty) {
                       return "Full name is required";
                     }
+                    if (value.trim().length > 100) {
+                      return "Name too long (max 100 characters)";
+                    }
                     if (!_isValidName(value.trim())) {
-                      return "Please enter a valid name (e.g. John A. Doe)";
+                      return "Please enter a valid name (e.g. John Doe or John A. Doe)";
                     }
                     return null;
                   },
@@ -179,6 +209,10 @@ bool _isValidName(String name) {
                   validator: (value) {
                     if (value == null || value.trim().isEmpty) {
                       return "Email is required";
+                    }
+                    
+                    if (value.trim().length > 254) {
+                      return "Email too long (max 254 characters)";
                     }
 
                     final email = value.trim().toLowerCase();
@@ -214,6 +248,9 @@ bool _isValidName(String name) {
                     if (value.length < 8) {
                       return "Password must be at least 8 characters";
                     }
+                    if (value.length > 128) {
+                      return "Password too long (max 128 characters)";
+                    }
                     return null;
                   },
                 ),
@@ -236,7 +273,7 @@ bool _isValidName(String name) {
                     Flexible(
                       child: RichText(
                         text: TextSpan(
-                          style: GoogleFonts.poppins(
+                          style: GoogleFonts.alice(
                             color: Colors.black87,
                             fontSize: 14,
                           ),
@@ -301,7 +338,7 @@ bool _isValidName(String name) {
                 // --- Already have an account ---
                 RichText(
                   text: TextSpan(
-                    style: GoogleFonts.poppins(
+                    style: GoogleFonts.alice(
                       color: Colors.black54,
                       fontSize: 14,
                     ),
